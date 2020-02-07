@@ -42,7 +42,6 @@ int xdp_link_attach(xdp_prog_t *prog, int ifindex, __u32 xdp_flags,
                  ifindex, -err, strerror(-err));
         return -1;
 	}
-
 	return 0;
 }
 

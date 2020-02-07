@@ -32,10 +32,15 @@ struct vlan_hdr_l {
 
 struct packet_rec
 {
-    char            m_header[MAX_PACKET_HEADER_SIZE];
-    int             m_header_size;
-    int             m_ip_index;
+    /* Input to the lower layer */
+    unsigned char   m_addr_set;
 	unsigned char   m_ip4;
+    struct in6_addr m_addr; /* u6_addr32[0] is used for v4 addresses, network order */
+    __u16           m_port; /* Network order */
+    /* Output from the lower layer */
+    char            m_header[MAX_PACKET_HEADER_SIZE];
+    __u16           m_header_size;
+    __u16           m_ip_index;
 };
 
 #endif /* XDPSOCK_H */

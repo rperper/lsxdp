@@ -68,6 +68,7 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs);
  * @param[in] prog The program handle.
  * @param[in] addr The address (as for connect) - please put in the port!
  * @param[in] addrLen The address length (as for connect)
+ * @param[in] ifport Optional ethernet system port to use.
  * @returns A pointer to lsxdp_socket_reqs_t if successful or NULL if not.
  * This pointer MUST be freed with a free() call when done.
  * @warning This function waits for up to 5 seconds for a ping to return.
@@ -75,7 +76,8 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs);
  **/
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const struct sockaddr *addr,
-                                         socklen_t addrLen);
+                                         socklen_t addrLen,
+                                         const char *ifport);
 /**
  * @fn xdp_get_poll_fd
  * @brief The the fd that can be used to determine if it's ok to send/recv now.
@@ -142,9 +144,10 @@ void xdp_socket_close(xdp_socket_t *socket);
  * @brief Call to close the use of the XDP package system after a successful
  *        call to xdp_prog_init.
  * @param[in] prog The handle to be closed (from xdp_prog_init)
+ * @param[in] unload 1 if we're to unload the loaded binary; 0 to not unload it.
  * @returns None
  **/
-void xdp_prog_done(xdp_prog_t *prog);
+void xdp_prog_done(xdp_prog_t *prog, int unload);
 /**
  * @fn xdp_get_last_error
  * @brief If a XDP function fails, call to pass in the program handle and get

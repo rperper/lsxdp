@@ -2,35 +2,30 @@
 
 #include "lsxdp.h"
 
+#include "libbpf/src/bpf.h"
 #include "poll.h"
 #include <linux/if_ether.h>
 #include "linux/in.h"
 #include "linux/icmp.h"
 
-#define PING_PKT_S 64
+#define DEBUG_MESSAGE(...) printf(__VA_ARGS__)
 
-// ping packet structure
-struct ping_pkt
-{
-    struct icmphdr hdr;
-    char msg[PING_PKT_S-sizeof(struct icmphdr)];
-};
-
-static u32 opt_xdp_flags = /* XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not set */
-                           /* XDP_FLAGS_SKB_MODE | // Generice or emulated (slow) */
-                           XDP_FLAGS_DRV_MODE | // Native XDP mode
-                           XDP_FLAGS_HW_MODE;   // Hardware offload
+static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not set */
+                           /*XDP_FLAGS_SKB_MODE | // Generic or emulated (slow)*/
+                           /*XDP_FLAGS_DRV_MODE | // Native XDP mode*/
+                           /* XDP_FLAGS_HW_MODE |   // Hardware offload*/
+                           0;
 static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
                                   /* XDP_COPY | // Force copy mode */
                                   /* XDP_ZEROCOPY | // Force zero copy */
-                                  XDP_USE_NEED_WAKEUP;// For same cpu for force yield
+                                  0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
 
 static int xsk_configure_umem(void *buffer, xdp_socket_t *sock, u64 size)
 {
 	struct xsk_umem_config cfg = {
 		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
 		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
-		.frame_size = sock->m_xdp_prog->m_max_frame_size,
+		.frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE,//sock->m_xdp_prog->m_max_frame_size,
 		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
 	};
 	int ret;
@@ -67,7 +62,9 @@ static int xsk_configure_socket(xdp_socket_t *sock)
 	if (ret)
     {
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "xsk_socket__create error %s", strerror(-ret));
+                 "xsk_socket__create error %s index: %d name: %s", strerror(-ret),
+                 sock->m_reqs->m_ifindex,
+                 sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_ifname);
         return -1;
     }
 	ret = bpf_get_link_xdp_id(sock->m_reqs->m_ifindex, &sock->m_progid,
@@ -119,9 +116,15 @@ static int get_ifs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *prog)
         }
         strncpy(prog->m_if[names[index].if_index].m_ifname, names[index].if_name,
                 sizeof(prog->m_if[names[index].if_index].m_ifname));
-        ++index;
         if (names[index].if_index > prog->m_max_if)
             prog->m_max_if = names[index].if_index;
+        if (!strcmp(prog->m_if[names[index].if_index].m_ifname, "lo"))
+            prog->m_if[names[index].if_index].m_disable = 1;
+        DEBUG_MESSAGE("Interface #%d, idx: %d, max: %d: %s %s\n", index,
+                      names[index].if_index, prog->m_max_if,
+                      prog->m_if[names[index].if_index].m_ifname,
+                      prog->m_if[names[index].if_index].m_disable ? "DISABLE":"");
+        ++index;
     }
     if_freenameindex(names);
     return ret;
@@ -154,14 +157,14 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
     prog->m_max_frame_size = max_frame_size;
     if (get_ifs(prog_init_err, prog_init_err_len, prog))
     {
-        xdp_prog_done(prog);
+        xdp_prog_done(prog, 0);
         return NULL;
     }
     if (max_frame_size <= 0 || max_frame_size > LSXDP_MAX_FRAME_SIZE)
     {
         snprintf(prog_init_err, prog_init_err_len,
                  "Invalid max frame size must be <= %d", LSXDP_MAX_FRAME_SIZE);
-        xdp_prog_done(prog);
+        xdp_prog_done(prog, 0);
         return NULL;
     }
 	ret = posix_memalign(&prog->m_bufs, getpagesize(), /* PAGE_SIZE aligned */
@@ -170,9 +173,10 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
     {
         snprintf(prog_init_err, prog_init_err_len,
                  "Insufficient memory allocating big buffer: %s", strerror(errno));
-        xdp_prog_done(prog);
+        xdp_prog_done(prog, 0);
         return NULL;
     }
+    DEBUG_MESSAGE("prog_init, %d bytes\n", NUM_FRAMES * max_frame_size);
     return prog;
 }
 
@@ -180,9 +184,6 @@ void xdp_socket_close ( xdp_socket_t* socket )
 {
     if (!socket)
         return;
-    //if (socket->m_xdp_prog->m_bpf_prog_fd)
-    //    xdp_link_detach(socket, socket->m_ifindex, opt_xdp_flags, 0);
-
     if (socket->m_sock_info.xsk)
         xsk_socket__delete(socket->m_sock_info.xsk);
     if (socket->m_umem.umem)
@@ -191,10 +192,27 @@ void xdp_socket_close ( xdp_socket_t* socket )
     free(socket);
 }
 
+static void detach_ping(xdp_prog_t *prog)
+{
+    int i;
+    for (i = 1; i <= prog->m_max_if; ++i)
+    {
+        if (prog->m_if[i].m_ping_attached)
+        {
+            prog->m_if[i].m_ping_attached = 0;
+            int rc = xdp_link_detach(prog, i, opt_xdp_flags,
+                                     0/*prog->m_if[i].m_progfd*/);
+            if (rc)
+                printf("xdp_link_detach failed: %s\n", prog->m_err);
+        }
+    }
+}
+
 xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs)
 {
     xdp_socket_t *socket;
 
+    detach_ping(prog); // Incompatible with sockets
     socket = malloc(sizeof(xdp_socket_t));
     if (!socket)
     {
@@ -217,30 +235,46 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs)
         xdp_socket_close(socket);
         return NULL;
     }
-    prog->m_xsks[prog->m_num_socks] = socket;
+    prog->m_xsks[prog->m_num_socks - 1] = socket;
 }
 
-static int load_obj(xdp_prog_t *prog)
+static int load_obj(xdp_prog_t *prog, const char *ifport)
 {
 	int err;
 	struct bpf_program *bpf_prog;
     int i;
+    int enabled_one = 0;
 
     for (i = 1; i <= prog->m_max_if; ++i)
     {
-        if (!prog->m_if[i].m_ifname[0])
+        if (!prog->m_if[i].m_ifname[0] || (!ifport && prog->m_if[i].m_disable))
             continue;
+        if (ifport && strcmp(ifport, prog->m_if[i].m_ifname))
+        {
+            DEBUG_MESSAGE("ifport specified and %s does not match, disabling\n",
+                          prog->m_if[i].m_ifname);
+            prog->m_if[i].m_disable = 1;
+            continue;
+        }
+        else if (ifport)
+            prog->m_if[i].m_disable = 0;
         if (prog->m_if[i].m_bpf_object)
             return 0; // Already done!
+        DEBUG_MESSAGE("For prog[%d], if: %d, name: %s\n", i,
+                      if_nametoindex(prog->m_if[i].m_ifname),
+                      prog->m_if[i].m_ifname);
         struct bpf_prog_load_attr prog_load_attr =
         {
-            .prog_type	= BPF_PROG_TYPE_XDP,
-            .ifindex	= i,
+            .prog_type = BPF_PROG_TYPE_XDP,
+            .ifindex   = (opt_xdp_flags & XDP_FLAGS_HW_MODE) ? i : 0,
         };
         prog_load_attr.file = "xdpsock_kern.o";
 
         /* Use libbpf for extracting BPF byte-code from BPF-ELF object, and
          * loading this into the kernel via bpf-syscall */
+        DEBUG_MESSAGE("bpf_prog_load_xattr, ifindex: %d\n", prog_load_attr.ifindex);
+        prog->m_if[i].m_bpf_object = NULL;
+        prog->m_if[i].m_bpf_prog_fd = -1;
         err = bpf_prog_load_xattr(&prog_load_attr, &prog->m_if[i].m_bpf_object,
                                   &prog->m_if[i].m_bpf_prog_fd);
         if (err)
@@ -248,31 +282,46 @@ static int load_obj(xdp_prog_t *prog)
             snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "Error loading BPF-OBJ file(%s) (%d): %s",
                      prog_load_attr.file, err, strerror(-err));
-            return -1;
+            prog->m_if[i].m_disable = 1;
+            continue;
         }
         /* Find a matching BPF prog section name */
         const char *prog_sec = "xdp_ping";
+        DEBUG_MESSAGE("bpf_object__find_program_by_title: %s, obj ptr: %p, prog_fd: %d\n",
+                      prog_sec, prog->m_if[i].m_bpf_object, prog->m_if[i].m_bpf_prog_fd);
         bpf_prog = bpf_object__find_program_by_title(prog->m_if[i].m_bpf_object,
                                                      prog_sec);
         if (!bpf_prog)
         {
             snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "ERR: finding progsec: %s\n", prog_sec);
-		    return -1;
+            prog->m_if[i].m_disable = 1;
+		    continue;
 	    }
-
+        DEBUG_MESSAGE("bpf_program__fd using prog ptr: %p\n", bpf_prog);
         prog->m_if[i].m_progfd = bpf_program__fd(bpf_prog);
         if (prog->m_if[i].m_progfd <= 0)
         {
             snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "ERR: bpf_program__fd failed");
-            return -1;
+            prog->m_if[i].m_disable = 1;
+            continue;
 	    }
 
+        DEBUG_MESSAGE("xdp_link_attach, if_index: %d %s, new prog_fd: %d\n", i,
+                      prog->m_if[i].m_ifname, prog->m_if[i].m_progfd);
         err = xdp_link_attach(prog, i, opt_xdp_flags, prog->m_if[i].m_progfd);
         if (err)
-            return -1;
+        {
+            prog->m_if[i].m_disable = 1;
+            continue;
+        }
+        prog->m_if[i].m_ping_attached = 1;
+        enabled_one = 1;
     }
+    if (!enabled_one)
+        // let the last error stand!
+        return -1;
     return 0;
 }
 
@@ -292,59 +341,28 @@ static unsigned short checksum(void *b, int len)
     return result;
 }
 
-static int send_icmp(xdp_prog_t *prog, const struct sockaddr *addr,
-                     socklen_t addrLen)
+static int send_connect(xdp_prog_t *prog, const struct sockaddr *addr,
+                        socklen_t addrLen)
 {
     int sockfd;
-    struct timeval tv_out;
-    struct ping_pkt ping;
     int i;
     int ret = 0;
 
-    sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0)
     {
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Error creating raw socket to get socket requirements: %s",
+                 "Error creating socket to get socket requirements: %s",
                  strerror(errno));
         return -1;
     }
-    tv_out.tv_sec = 5;
-    tv_out.tv_usec = 0;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_out,
-               sizeof tv_out);
-    memset(&ping, 0, sizeof(ping));
-    ping.hdr.type = ICMP_ECHO;
-    ping.hdr.un.echo.id = getpid();
-    for ( i = 0; i < sizeof(ping.msg)-1; i++ )
-        ping.msg[i] = i+'0';
-    ping.msg[i] = 0;
-    ping.hdr.un.echo.sequence = 0;
-    ping.hdr.checksum = checksum(&ping, sizeof(ping));
-    ret = sendto(sockfd, &ping, sizeof(ping), 0, addr, addrLen);
-    if (ret <= 0)
-    {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Error sending ping to remote system: %s", strerror(errno));
-        ret = -1;
-    }
-    if (ret >= 0)
-    {
-        struct sockaddr r_addr;
-        socklen_t addr_len;
-        ret = recvfrom(sockfd, &ping, sizeof(ping), 0, &r_addr, &addr_len);
-        if (ret <= 0)
-        {
-            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "Error receiving ping response from remote system: %s",
-                     strerror(errno));
-            ret = -1;
-        }
-    }
-    if (ret >= 0)
-        ret = 0;
+    DEBUG_MESSAGE("Doing connect\n");
+    if (connect(sockfd, addr, addrLen) < 0)
+        DEBUG_MESSAGE("connect failed, but not necessarily bad\n");
+    else
+        DEBUG_MESSAGE("connect worked\n");
     close(sockfd);
-    return ret;
+    return 0;
 }
 
 int find_map_fd(xdp_prog_t *prog, struct bpf_object *bpf_obj, const char *mapname)
@@ -362,18 +380,70 @@ int find_map_fd(xdp_prog_t *prog, struct bpf_object *bpf_obj, const char *mapnam
 	return bpf_map__fd(map);
 }
 
+static int set_map(xdp_prog_t *prog, const struct sockaddr *addr,
+                   socklen_t addrLen)
+{
+    int i;
+    struct packet_rec rec;
+    lsxdp_socket_reqs_t *reqs;
+    int found = 0;
+    memset(&rec, 0, sizeof(rec));
+    rec.m_addr_set = 1;
+    if (addrLen == sizeof(struct sockaddr_in))
+    {
+        rec.m_addr_set  = 1;
+        rec.m_ip4       = 1;
+        rec.m_addr.in6_u.u6_addr32[0] = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
+        rec.m_port      = ((struct sockaddr_in *)addr)->sin_port;
+    }
+    else
+    {
+        DEBUG_MESSAGE("Not supporting IP6 yet\n");
+        return -1;
+    }
+    for (i = 1; i <= prog->m_max_if; ++i)
+    {
+        if (!prog->m_if[i].m_disable &&
+            prog->m_if[i].m_bpf_object)
+        {
+            int map_fd;
+            int key = 0; // Separate maps for each IF for now, all with key 0
+            map_fd = find_map_fd(prog, prog->m_if[i].m_bpf_object,
+                                 "packet_rec_def");
+            if (map_fd == -1)
+            {
+                DEBUG_MESSAGE("Can't find map fd\n");
+                return -1;
+            }
+
+            if (bpf_map_update_elem(map_fd, &key, &rec, 0) == 0)
+                found = 1;
+            else
+                DEBUG_MESSAGE("ERROR IN BPF_MAP_UPDATE_ELEM %d\n", errno);
+        }
+    }
+    if (!found)
+    {
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Can not find map to set update");
+        return -1;
+    }
+    return 0;
+}
+
 static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                                       const struct sockaddr *addr,
                                       socklen_t addrLen)
 {
     int i;
     struct packet_rec rec;
-    int found = 0;
+    int found_index = 0;
     lsxdp_socket_reqs_t *reqs;
 
     for (i = 1; i <= prog->m_max_if; ++i)
     {
-        if (prog->m_if[i].m_bpf_object)
+        if (!prog->m_if[i].m_disable &&
+            prog->m_if[i].m_bpf_object)
         {
             int map_fd;
             int key = 0; // Separate maps for each IF for now, all with key 0
@@ -381,19 +451,23 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                                  "packet_rec_def");
             if (map_fd == -1)
                 return NULL;
-            if (((bpf_map_lookup_elem(map_fd, &key, &rec)) != 0) &&
-                (rec.m_ip4 &&
-                 ((struct iphdr *)&rec.m_header[rec.m_ip_index])->saddr == ((struct sockaddr_in *)addr)->sin_addr.s_addr))
+            int rc = bpf_map_lookup_elem(map_fd, &key, &rec);
+            if ((rc == 0 && rec.m_ip4 &&
+                ((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr == ((struct sockaddr_in *)addr)->sin_addr.s_addr))
             {
-                found = 1;
+                DEBUG_MESSAGE("Found index at device #%d %s\n", i,
+                              prog->m_if[i].m_ifname);
+                found_index = i;
                 break;
             }
+            else if (rc != 0)
+                DEBUG_MESSAGE("bpf_map_lookup_elem failed: %d\n", errno);
         }
     }
-    if (!found)
+    if (!found_index)
     {
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can not find map entry for successful ping");
+                 "Can not find map entry of successful connect");
         return NULL;
     }
     reqs = malloc(sizeof(lsxdp_socket_reqs_t));
@@ -403,7 +477,7 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                  "Insufficient memory to allocate required data");
         return NULL;
     }
-    reqs->m_ifindex = i;
+    reqs->m_ifindex = found_index;
     reqs->m_port = ((struct sockaddr_in *)addr)->sin_port;
     memcpy(&reqs->m_rec, &rec, sizeof(rec));
     return reqs;
@@ -411,30 +485,50 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
 
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const struct sockaddr *addr,
-                                         socklen_t addrLen)
+                                         socklen_t addrLen,
+                                         const char *ifport)
 {
     lsxdp_socket_reqs_t *reqs;
 
-    if (load_obj(prog))
+    DEBUG_MESSAGE("xdp_get_socket_reqs - load_obj\n");
+    if (load_obj(prog, ifport))
         return NULL;
-    if (send_icmp(prog, addr, addrLen))
+    DEBUG_MESSAGE("xdp_get_socket_reqs - set_map\n");
+    if (set_map(prog, addr, addrLen) == -1)
         return NULL;
+    DEBUG_MESSAGE("xdp_get_socket_reqs - send_tcp\n");
+    if (send_connect(prog, addr, addrLen))
+        return NULL;
+    DEBUG_MESSAGE("xdp_get_socket_reqs - check_map\n");
     reqs = check_map(prog, addr, addrLen);
     if (!reqs)
         return NULL;
+    DEBUG_MESSAGE("xdp_get_socket_reqs - WORKED! header size %d "
+                  "source mac: %02x:%02x:%02x:%02x:%02x:%02x "
+                  "dest mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                  reqs->m_rec.m_header_size,
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_source[0],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_source[1],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_source[2],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_source[3],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_source[4],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_source[5],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[0],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[1],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[2],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[3],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[4],
+                  ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[5]);
     return reqs;
 }
 
-void xdp_prog_done ( xdp_prog_t* prog )
+void xdp_prog_done ( xdp_prog_t* prog, int unload )
 {
     int i;
     if (!prog)
         return;
-    for (i = 1; i <= prog->m_max_if; ++i)
-    {
-        if (prog->m_if[i].m_progfd)
-            xdp_link_detach(prog, i, opt_xdp_flags, prog->m_if[i].m_progfd);
-    }
+    if (unload)
+        detach_ping(prog);
     if (prog->m_num_socks)
         fprintf(stderr, "%d Sockets remain open!\n", prog->m_num_socks);
     if (prog->m_bufs)
@@ -590,4 +684,9 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len)
 int xdp_send_udp_headroom(xdp_socket_t *sock)
 {
     return sock->m_reqs->m_rec.m_header_size;
+}
+
+const char *xdp_get_last_error(xdp_prog_t *prog)
+{
+    return prog->m_err;
 }

@@ -70,10 +70,12 @@ typedef  struct xdp_socket_s
 
 typedef struct xdp_if_s
 {
+    int                     m_disable;
     char                    m_ifname[IF_NAMESIZE];
     struct bpf_object      *m_bpf_object;
     int                     m_bpf_prog_fd;
     int                     m_progfd;
+    int                     m_ping_attached;
 } xdp_if_t;
 
 typedef struct xdp_prog_s
