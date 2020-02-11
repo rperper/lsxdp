@@ -55,12 +55,13 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
  * @param[in] reqs The required information to setup a socket.  Use
  *                 xdp_get_socket_reqs to obtain this info and leave it
  *                 allocated through the life of this socket.
+ * @param[in] port The port to use for UDP traffic.
  * @returns A pointer to xdp_socket_t if successful and NULL if an error can be
  *          reported.
  * @note reqs is not freed when the socket is freed so you can reuse it for
  *       another socket call.
  **/
-xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs);
+xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port);
 /**
  * @fn xdp_get_socket_reqs
  * @brief Does what connect does on a regular socket, but uses a ping packet
@@ -68,6 +69,8 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs);
  * @param[in] prog The program handle.
  * @param[in] addr The address (as for connect) - please put in the port!
  * @param[in] addrLen The address length (as for connect)
+ * @param[in] addr_bind An optional parameter of the local address to use.  The
+ *            length is assumed to be the same as the addrLen above.
  * @param[in] ifport Optional ethernet system port to use.
  * @returns A pointer to lsxdp_socket_reqs_t if successful or NULL if not.
  * This pointer MUST be freed with a free() call when done.
@@ -77,6 +80,7 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs);
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const struct sockaddr *addr,
                                          socklen_t addrLen,
+                                         const struct sockaddr *addr_bind,
                                          const char *ifport);
 /**
  * @fn xdp_get_poll_fd
@@ -123,6 +127,15 @@ int xdp_send(xdp_socket_t *sock, void *data, int len);
 int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len);
 
 /**
+ * @fd xdp_send_completed
+ * @brief Tries to complete all sends, but doesn't wait at all.
+ * @param[in] sock The socket sent on.
+ * @param[out] still_pending Whether there are still pending sends.
+ * @returns 0 for no error and -1 for an error.
+ **/
+int xdp_send_completed(xdp_socket_t *sock, int *still_pending);
+
+/**
  * @fd xdp_send_udp_headroom
  * @brief Returns the number of bytes of headroom necessary for a UDP packet.
  * @note This is not hard coded to allow the concept of virtual adapters which
@@ -145,9 +158,10 @@ void xdp_socket_close(xdp_socket_t *socket);
  *        call to xdp_prog_init.
  * @param[in] prog The handle to be closed (from xdp_prog_init)
  * @param[in] unload 1 if we're to unload the loaded binary; 0 to not unload it.
+ * @param[in] force_unload 1 if we're to unload whatever XDP program is loaded!
  * @returns None
  **/
-void xdp_prog_done(xdp_prog_t *prog, int unload);
+void xdp_prog_done(xdp_prog_t *prog, int unload, int force_unload);
 /**
  * @fn xdp_get_last_error
  * @brief If a XDP function fails, call to pass in the program handle and get

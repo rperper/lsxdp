@@ -58,8 +58,8 @@ typedef struct lsxdp_socket_reqs_s
 typedef  struct xdp_socket_s
 {
     struct xdp_prog_s      *m_xdp_prog;
-    struct xsk_umem_info    m_umem;
-    struct xsk_socket_info  m_sock_info;
+    struct xsk_umem_info   *m_umem;
+    struct xsk_socket_info *m_sock_info;
     lsxdp_socket_reqs_t    *m_reqs;
     int                     m_queue;
     __u32                   m_progid;
@@ -76,6 +76,7 @@ typedef struct xdp_if_s
     int                     m_bpf_prog_fd;
     int                     m_progfd;
     int                     m_ping_attached;
+    int                     m_socket_attached;
 } xdp_if_t;
 
 typedef struct xdp_prog_s

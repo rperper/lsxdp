@@ -9,6 +9,7 @@
  * If you do not use this mode, libbpf can supply an XDP program for you.
  */
 
+/*
 struct bpf_map_def SEC("maps") xsks_map = {
 	.type        = BPF_MAP_TYPE_XSKMAP,
 	.key_size    = sizeof(int),
@@ -21,11 +22,57 @@ static unsigned int rr;
 
 SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 {
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+    int h_proto;
+	struct hdr_cursor nh;
+    struct ethhdr *eth;
+    struct iphdr  *iphdr;
+    struct udphdr *udphdr;
+	nh.pos = data;
+
+    bpf_printk("sock_prog ENTRY!\n");
+	h_proto = parse_ethhdr(&nh, data_end, &eth);
+    if (h_proto == bpf_htons(ETH_P_IP))
+    {
+   		int ip_type = parse_iphdr(&nh, data_end, &iphdr);
+		if (ip_type != IPPROTO_UDP)
+        {
+            bpf_printk("sock_prog IP NOT UDP: %d\n", ip_type);
+			goto out;
+        }
+        else
+        {
+            bpf_printk("sock_prog IP dest: %u.%u",
+                       ((unsigned char *)&iphdr->saddr)[0],
+                       ((unsigned char *)&iphdr->saddr)[1]);
+            bpf_printk("  .%u.%u\n",
+                       ((unsigned char *)&iphdr->saddr)[2],
+                       ((unsigned char *)&iphdr->saddr)[3]);
+        }
+    }
+    else if (h_proto == bpf_htons(ETH_P_IPV6))
+    {
+        bpf_printk("sock_prog IPv6\n");
+		goto out;
+    }
+    else
+    {
+        bpf_printk("sock_prog parse_ethhdr failed proto: %d\n", bpf_htons(h_proto));
+        goto out;
+    }
+  	if (parse_udphdr(&nh, data_end, &udphdr) == -1)
+    {
+        bpf_printk("sock_prog parse_tcphdr failed\n");
+        goto out;
+    }
+    bpf_printk("sock_prog ports: %d %d\n", udphdr->source, udphdr->dest);
+out:
 	rr = (rr + 1) & (MAX_SOCKS - 1);
 
 	return bpf_redirect_map(&xsks_map, rr, XDP_DROP);
 }
-
+*/
 /* NEVER FORGET THAT eBPF ONLY SUPPORTS UNROLLED STATIC SIZED LOOPS!!! */
 /* NO memcpy EXCEPT FOR SPECIFIC SIZES!!! */
 /* Use this instead, requires a label of 'out:' to goto if an error */

@@ -29,3 +29,18 @@ To run it you must be using an Ethernet driver that allows Large Receive Offload
 C:\Program Files\Oracle\VirtualBox>vboxmanage modifyvm "Lubuntu 19.10" --nictype1 Am79C973
 ```
 Once run, you can restart the virtual machine and begin testing.
+
+The test program has a lot of options.  To test it with UDP, on interface enp0s3 destination IP address 192.168.0.197, port 1972 and pausing after it runs you'd execute:
+```
+sudo ./testxdp -w -i 192.168.0.197 -e enp0s3 -p 1972
+```
+Note that since testxdp is an XDP program, it must be run as root.
+
+
+Other test programs
+-------------------
+Also in the test directory is **socketudprecv** which allows you to pretend to be a UDP receiver and it traces anything it receives.  It can receive tests from testxdp.  For example, to run it on 192.168.0.197 listening on port 1972, execute:
+```
+./socketudprecv -i 192.168.0.197 -p 1972
+```
+Note that it does not have to run run as root.
