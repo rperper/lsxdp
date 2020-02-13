@@ -9,7 +9,7 @@
  * If you do not use this mode, libbpf can supply an XDP program for you.
  */
 
-/*
+
 struct bpf_map_def SEC("maps") xsks_map = {
 	.type        = BPF_MAP_TYPE_XSKMAP,
 	.key_size    = sizeof(int),
@@ -18,10 +18,13 @@ struct bpf_map_def SEC("maps") xsks_map = {
 };
 
 
-static unsigned int rr;
+/* The 'rr' variable and it's use below is from the sample, but it appears to
+ * not be the right way to use AF_XDP.  */
+//static unsigned int rr;
 
 SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 {
+    int index = ctx->rx_queue_index;
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
     int h_proto;
@@ -31,7 +34,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     struct udphdr *udphdr;
 	nh.pos = data;
 
-    bpf_printk("sock_prog ENTRY!\n");
+    bpf_printk("sock_prog ENTRY, index: %d\n", index);
 	h_proto = parse_ethhdr(&nh, data_end, &eth);
     if (h_proto == bpf_htons(ETH_P_IP))
     {
@@ -43,7 +46,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
         }
         else
         {
-            bpf_printk("sock_prog IP dest: %u.%u",
+            bpf_printk("sock_prog IP source: %u.%u",
                        ((unsigned char *)&iphdr->saddr)[0],
                        ((unsigned char *)&iphdr->saddr)[1]);
             bpf_printk("  .%u.%u\n",
@@ -66,13 +69,20 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
         bpf_printk("sock_prog parse_tcphdr failed\n");
         goto out;
     }
-    bpf_printk("sock_prog ports: %d %d\n", udphdr->source, udphdr->dest);
+    bpf_printk("sock_prog ports: %d %d\n", bpf_htons(udphdr->source),
+               bpf_htons(udphdr->dest));
 out:
-	rr = (rr + 1) & (MAX_SOCKS - 1);
+	//rr = (rr + 1) & (MAX_SOCKS - 1);
 
-	return bpf_redirect_map(&xsks_map, rr, XDP_DROP);
+	//return bpf_redirect_map(&xsks_map, rr, XDP_PASS);
+    /* A set entry here means that the correspnding queue_id
+     * has an active AF_XDP socket bound to it. */
+    if (bpf_map_lookup_elem(&xsks_map, &index))
+        return bpf_redirect_map(&xsks_map, index, 0);
+
+    return XDP_PASS;
 }
-*/
+
 /* NEVER FORGET THAT eBPF ONLY SUPPORTS UNROLLED STATIC SIZED LOOPS!!! */
 /* NO memcpy EXCEPT FOR SPECIFIC SIZES!!! */
 /* Use this instead, requires a label of 'out:' to goto if an error */

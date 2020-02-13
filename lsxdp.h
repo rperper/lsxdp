@@ -110,33 +110,37 @@ void *xdp_get_send_buffer(xdp_socket_t *sock);
  * @param[in] data The data to send.
  * @param[in] len The length of the data to send.  Must not be greater than
  * the supplied packet length.
+ * @param[in] last 1 if this is the last (kick it now) or 0 if there are more
+ * to send.
  * @returns -1 for an error or 0 for success.
  **/
-int xdp_send(xdp_socket_t *sock, void *data, int len);
+int xdp_send(xdp_socket_t *sock, void *data, int len, int last);
 
 /**
- * @fd xdp_send_zc
+ * @fn xdp_send_zc
  * @brief Sends a packet to the remote system.  Set it up the way you'd send
  * a UDP packet.  This is a zero copy version of the xdp_send function, so you
  * must leave sufficient headroom to add the headers.
  * @param[in] sock The socket to send on (created with xdp_socket)
  * @param[in] buffer The starting point of the buffer (space for headroom).
  * @param[in] len The length of the data to send (not including the headroom).
+ * @param[in] last 1 if this is the last (kick it now) or 0 if there are more
+ * to send.
  * @returns -1 for an error or 0 for success.
  **/
-int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len);
+int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last);
 
 /**
- * @fd xdp_send_completed
+ * @fn xdp_send_completed
  * @brief Tries to complete all sends, but doesn't wait at all.
  * @param[in] sock The socket sent on.
- * @param[out] still_pending Whether there are still pending sends.
+ * @param[out] still_pending The number of pending packets (0 if done).
  * @returns 0 for no error and -1 for an error.
  **/
 int xdp_send_completed(xdp_socket_t *sock, int *still_pending);
 
 /**
- * @fd xdp_send_udp_headroom
+ * @fn xdp_send_udp_headroom
  * @brief Returns the number of bytes of headroom necessary for a UDP packet.
  * @note This is not hard coded to allow the concept of virtual adapters which
  * would have varied amount of headroom requirements.
@@ -144,6 +148,40 @@ int xdp_send_completed(xdp_socket_t *sock, int *still_pending);
  * @returns The number of bytes of headroom.
  **/
 int xdp_send_udp_headroom(xdp_socket_t *sock);
+
+/**
+ * @typedef xdp_recv_raw_details
+ * @brief Used to properly return a received packet
+ **/
+typedef struct xdp_recv_raw_details_s
+{
+    u64 m_addr;
+    u32 m_idx_fq;
+} xdp_recv_raw_details_t;
+
+/**
+ * @fn xdp_recv_raw
+ * @brief Receives a packet from the remote system.  This is a raw packet, NOT
+ * a UDP packet.  This is a zero copy version and it includes the headers.
+ * @param[in] sock The socket to send on (created with xdp_socket)
+ * @param[out] buffer The received buffer.
+ * @param[out] sz The length of the data received (packet length).
+ * @param[out] details The details to be used in the xdp_recv_raw_return
+ * @returns -1 for an error or 0 for success.
+ * @note You MUST call poll before calling this function.
+ * @note You MUST return the received buffer with xdp_recv_raw_return
+ **/
+int xdp_recv_raw(xdp_socket_t *sock, char **buffer, int *sz,
+                 xdp_recv_raw_details_t *details);
+
+/**
+ * @fn xdp_recv_raw_return
+ * @brief Returns a received packet back to the system for reuse.
+ * @param[in] sock The socket to send on (created with xdp_socket)
+ * @param[in] details The details from xdp_recv_raw.
+ * @returns -1 for an error or 0 for success.
+ **/
+int xdp_recv_raw_return(xdp_socket_t *sock, xdp_recv_raw_details_t *details);
 
 /**
  * @fn xdp_socket_close
