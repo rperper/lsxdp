@@ -131,19 +131,25 @@ int do_recv(xdp_prog_t *prog, xdp_socket_t *sock)
         }
         else
         {
-            xdp_recv_raw_details_t details;
-            char *buffer;
+            void *buffer;
+            struct sockaddr_in6 sa;
+            int sa_len = sizeof(sa);
             int sz;
             ret = 0;
             printf("\nPoll successful (ret: %d), doing receive\n", ret);
-            ret = xdp_recv_raw(sock, &buffer, &sz, &details);
+            ret = xdp_recv(sock, &buffer, &sz, (struct sockaddr *)&sa, &sa_len);
             if (ret)
             {
-                printf("Error in xdp_recv_raw: %s\n", xdp_get_last_error(prog));
+                printf("Error in xdp_recv: %s\n", xdp_get_last_error(prog));
                 break;
             }
-            else
-                xdp_recv_raw_return(sock, &details);
+            else if (!buffer)
+                continue;
+            else if (xdp_recv_return(sock, buffer))
+            {
+                printf("Error in xdp_recv_return: %s\n", xdp_get_last_error(prog));
+                break;
+            }
         }
     }
     return ret;

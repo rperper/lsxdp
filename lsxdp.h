@@ -150,38 +150,31 @@ int xdp_send_completed(xdp_socket_t *sock, int *still_pending);
 int xdp_send_udp_headroom(xdp_socket_t *sock);
 
 /**
- * @typedef xdp_recv_raw_details
- * @brief Used to properly return a received packet
- **/
-typedef struct xdp_recv_raw_details_s
-{
-    u64 m_addr;
-    u32 m_idx_fq;
-} xdp_recv_raw_details_t;
-
-/**
- * @fn xdp_recv_raw
- * @brief Receives a packet from the remote system.  This is a raw packet, NOT
- * a UDP packet.  This is a zero copy version and it includes the headers.
+ * @fn xdp_recv
+ * @brief Receives a UDP packet from the remote system.  While you must call
+ * poll before this operation, it may return with no data (NULL *buffer)
+ * if the receive is NOT for a UDP packet.
  * @param[in] sock The socket to send on (created with xdp_socket)
- * @param[out] buffer The received buffer.
- * @param[out] sz The length of the data received (packet length).
- * @param[out] details The details to be used in the xdp_recv_raw_return
+ * @param[out] data The received UDP data.
+ * @param[out] sz The length of the data received (UDP data length).
+ * @param[out] addr The optional IP address
+ * @param[in,out] addrlen On input the maximum length, on output the real length
+ * of the addr.  Optional.
  * @returns -1 for an error or 0 for success.
  * @note You MUST call poll before calling this function.
- * @note You MUST return the received buffer with xdp_recv_raw_return
+ * @note You MUST return the received buffer with xdp_recv_return
  **/
-int xdp_recv_raw(xdp_socket_t *sock, char **buffer, int *sz,
-                 xdp_recv_raw_details_t *details);
+int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *addr,
+             socklen_t *addrlen);
 
 /**
- * @fn xdp_recv_raw_return
+ * @fn xdp_recv_return
  * @brief Returns a received packet back to the system for reuse.
  * @param[in] sock The socket to send on (created with xdp_socket)
- * @param[in] details The details from xdp_recv_raw.
+ * @param[in] data The data buffer from xdp_recv.
  * @returns -1 for an error or 0 for success.
  **/
-int xdp_recv_raw_return(xdp_socket_t *sock, xdp_recv_raw_details_t *details);
+int xdp_recv_return(xdp_socket_t *sock, void *data);
 
 /**
  * @fn xdp_socket_close

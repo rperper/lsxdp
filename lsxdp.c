@@ -22,6 +22,7 @@ static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
                                   /* XDP_COPY | // Force copy mode */
                                   /* XDP_ZEROCOPY | // Force zero copy */
                                   0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
+static u32 s_pending_recv = XSK_RING_PROD__DEFAULT_NUM_DESCS / 2;
 
 static int xsk_configure_umem(void *buffer, xdp_socket_t *sock, u64 size)
 {
@@ -60,6 +61,8 @@ static int xsk_configure_socket(xdp_socket_t *sock)
 	struct xsk_socket_config cfg;
 	int ret;
 	int ifindex = sock->m_reqs->m_ifindex;
+    u32 idx;
+    int i;
 
 	sock->m_sock_info = calloc(1, sizeof(*sock->m_sock_info));
 	if (!sock->m_sock_info)
@@ -97,20 +100,19 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                  "bpf_get_link_xdp_id error %s", strerror(-ret));
 		return -1;
     }
-    /*
+    DEBUG_MESSAGE("Put a lot packets into the fill queue so they can be used for recv\n");
 	ret = xsk_ring_prod__reserve(&sock->m_umem->fq,
-                                 XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx);
-	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS)
+                                 s_pending_recv, &idx);
+	if (ret != s_pending_recv)
     {
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "xsk_ring_prod__reserve error %s", strerror(-ret));
 		return -1;
     }
-	for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; i++)
+	for (i = 0; i < s_pending_recv; i++)
 		*xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx++) =
 			i * sock->m_xdp_prog->m_max_frame_size;
 	xsk_ring_prod__submit(&sock->m_umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS);
-	*/
 	return 0;
 }
 
@@ -847,50 +849,197 @@ int xdp_send_udp_headroom(xdp_socket_t *sock)
     return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
 }
 
-int xdp_recv_raw(xdp_socket_t *sock, char **buffer, int *sz,
-                 xdp_recv_raw_details_t *details)
+int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
+                      struct sockaddr *addr, socklen_t *addrlen)
+{
+    /* Note to return 1 to ignore packet, 0 to continue processing, and -1 for
+     * an error.  */
+    if (len < xdp_send_udp_headroom(sock))
+    {
+        DEBUG_MESSAGE("Recv Packet too small to be UDP\n");
+        return 1;
+    }
+    *header_pos = sizeof(struct ethhdr);
+    if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_IP))
+    {
+        struct iphdr *iph = (struct iphdr *)(pkt + *header_pos);
+        int hdrsize = iph->ihl * 4;
+        *header_pos += hdrsize;
+        if (len < *header_pos)
+        {
+            DEBUG_MESSAGE("Recv Packet too small to be UDP IPv4\n");
+            return 1;
+        }
+        if (iph->protocol != IPPROTO_UDP)
+        {
+            DEBUG_MESSAGE("Recv not UDP\n");
+            return 1;
+        }
+        if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in))
+        {
+            ((struct sockaddr_in *)addr)->sin_family = AF_INET;
+            ((struct sockaddr_in *)addr)->sin_addr.s_addr = iph->saddr;
+        }
+        DEBUG_MESSAGE("Recv Remote addr %u.%u.%u.%u\n",
+                      ((unsigned char *)&iph->saddr)[0],
+                      ((unsigned char *)&iph->saddr)[1],
+                      ((unsigned char *)&iph->saddr)[2],
+                      ((unsigned char *)&iph->saddr)[3]);
+    }
+    else if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_IPV6))
+    {
+        struct ipv6hdr *ip6h = (struct ipv6hdr *)(pkt + *header_pos);
+        *header_pos += sizeof(struct ipv6hdr);
+        if (len < *header_pos)
+        {
+            DEBUG_MESSAGE("Recv Packet too small to be UDP IPv6\n");
+            return 1;
+        }
+        if (ip6h->nexthdr != IPPROTO_UDP)
+        {
+            DEBUG_MESSAGE("Recv not UDP (IPv6)\n");
+            return 1;
+        }
+        if (addr && addrlen && *addrlen > sizeof(struct sockaddr_in6))
+        {
+            ((struct sockaddr_in6 *)addr)->sin6_family = AF_INET6;
+            memcpy(&((struct sockaddr_in6 *)addr)->sin6_addr, &ip6h->saddr,
+                   sizeof(struct in6_addr));
+        }
+    }
+    else
+    {
+        DEBUG_MESSAGE("Recv not IPv4 or IPv6\n");
+        return 1;
+    }
+    return 0;
+}
+
+int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len, int *header_pos)
+{
+    struct udphdr *udp = (struct udphdr *)((unsigned char *)pkt + *header_pos);
+    if (*header_pos + sizeof(struct udphdr) > *len)
+    {
+        DEBUG_MESSAGE("Recv buffer too small for UDP\n");
+        return 1;
+    }
+    if (udp->dest != sock->m_reqs->m_port)
+    {
+        DEBUG_MESSAGE("Recv port mismatch (%d != %d)\n",
+                      __constant_htons(udp->dest),
+                      __constant_htons(sock->m_reqs->m_port));
+        return 1;
+    }
+    if (*len < (*header_pos) + __constant_htons(udp->len))
+    {
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Received packet: %d smaller than UDP length allows: %d",
+                 *len, (*header_pos) + __constant_htons(udp->len));
+        return -1;
+    }
+    *len = (*header_pos) + __constant_htons(udp->len);
+    *header_pos += sizeof(struct udphdr);
+    return 0;
+}
+
+static void recv_return_raw(xdp_socket_t *sock, u32 idx_fq, u64 addr)
+{
+    *xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx_fq++) = addr;
+	xsk_ring_prod__submit(&sock->m_sock_info->umem->fq, 1);
+	xsk_ring_cons__release(&sock->m_sock_info->rx, 1);
+	sock->m_sock_info->rx_npkts += 1;
+}
+
+
+int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr,
+             socklen_t *addrlen)
 {
 	unsigned int rcvd;
 	u32 idx_rx = 0, idx_fq = 0;
 	int ret;
 
-    *buffer = NULL;
+    *data = NULL;
     *sz = 0;
-	rcvd = xsk_ring_cons__peek(&sock->m_sock_info->rx, 1, &idx_rx);
-	if (!rcvd)
-		return 0; // Actually, since a poll should have been done this shouldn't happen!
+	while ((rcvd = xsk_ring_cons__peek(&sock->m_sock_info->rx, 1, &idx_rx)))
+    {
 
-	ret = xsk_ring_prod__reserve(&sock->m_sock_info->umem->fq, rcvd, &idx_fq);
-	while (ret != rcvd) {
-		if (ret < 0)
-        {
-            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "xsk_ring_prod__reserve failed on receive: %s",
-                     strerror(-ret));
-            return -1;
+        /*
+        ret = xsk_ring_prod__reserve(&sock->m_sock_info->umem->fq, rcvd, &idx_fq);
+        while (ret != rcvd) {
+            if (ret < 0)
+            {
+                snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                         "xsk_ring_prod__reserve failed on receive: %s",
+                         strerror(-ret));
+                return -1;
+            }
+            DEBUG_MESSAGE("Looping on receive finished queue?\n");
+            ret = xsk_ring_prod__reserve(&sock->m_sock_info->umem->fq, rcvd, &idx_fq);
         }
-        DEBUG_MESSAGE("Looping on receive finished queue?\n");
-		ret = xsk_ring_prod__reserve(&sock->m_sock_info->umem->fq, rcvd, &idx_fq);
-	}
-    details->m_idx_fq = idx_fq;
-    u64 addr = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx)->addr;
-    details->m_addr = addr;
-    u32 len = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx++)->len;
-    char *pkt = xsk_umem__get_data(sock->m_sock_info->umem->buffer, addr);
-    *buffer = pkt;
-    *sz = len;
+        */
+        u64 addr = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx)->addr;
+        u32 len = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx)->len;
+        char *pkt = xsk_umem__get_data(sock->m_sock_info->umem->buffer, addr);
+        int res;
+        int header_pos = 0;
+        xdp_recv_raw_details_t *details;
 
-    traceBuffer(*buffer, *sz);
+        traceBuffer(pkt, len);
+        res = parse_recv_ip_hdr(sock, pkt, len, &header_pos, sockaddr, addrlen);
+        if (res == -1)
+            return -1;
+        else if (res == 1)
+        {
+            recv_return_raw(sock, idx_fq, addr);
+            continue;
+        }
+        res = parse_recv_udp_hdr(sock, pkt, &len, &header_pos);
+        if (res == -1)
+            return -1;
+        else if (res == 1)
+        {
+            recv_return_raw(sock, idx_fq, addr);
+            continue;
+        }
+        details = (xdp_recv_raw_details_t *)(pkt + XDP_RAW_DETAILS_POS);
+        details->m_idx_fq = idx_fq;
+        details->m_addr = addr;
+        details->m_header_size = header_pos;
+        *data = (pkt + header_pos);
+        *sz = len - header_pos;
+        DEBUG_MESSAGE("recv, data: %p, buffer: %p, details: %p\n", data, pkt,
+                      details);
+        traceBuffer(*data, *sz);
+        return 0;
+    }
+    DEBUG_MESSAGE("No UDP data\n");
     return 0;
 }
 
-int xdp_recv_raw_return(xdp_socket_t *sock, xdp_recv_raw_details_t *details)
+int xdp_recv_return(xdp_socket_t *sock, void *data)
 {
-    *xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, details->m_idx_fq++) = details->m_addr;
-
-	xsk_ring_prod__submit(&sock->m_sock_info->umem->fq, 1);
-	xsk_ring_cons__release(&sock->m_sock_info->rx, 1);
-	sock->m_sock_info->rx_npkts += 1;
+    xdp_recv_raw_details_t *details;
+    void *buffer;
+	if (data < sock->m_umem->buffer ||
+        data > sock->m_umem->buffer + (NUM_FRAMES + 1) * sock->m_xdp_prog->m_max_frame_size)
+    {
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "xdp_recv_return invalid buffer (data: %p, buffer: %p)",
+                 data, sock->m_umem->buffer);
+        return -1;
+    }
+    buffer = (void *)(((__u64)data / sock->m_xdp_prog->m_max_frame_size) *
+                      sock->m_xdp_prog->m_max_frame_size);
+    details = (xdp_recv_raw_details_t *)((char *)buffer + XDP_RAW_DETAILS_POS);
+    DEBUG_MESSAGE("recv_return, data: %p, buffer: %p, details: %p\n", data,
+                  buffer, details);
+    if (buffer + details->m_header_size != data)
+    {
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "xdp_recv_return buffer not expected: %p != %p", buffer, data);
+        return -1;
+    }
+    recv_return_raw(sock, details->m_idx_fq, details->m_addr);
     return 0;
 }
 

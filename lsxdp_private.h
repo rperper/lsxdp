@@ -90,6 +90,22 @@ typedef struct xdp_prog_s
     int                     m_max_frame_size;
 } xdp_prog_t;
 
+/**
+ * @typedef xdp_recv_raw_details
+ * @brief Used to properly return a received packet.  This is jammed into the
+ * headroom of the packet (just after the ethernet header so that the ethernet
+ * info is available for subsequent sends) so that it can be returned
+ * successfully.
+ **/
+struct xdp_recv_raw_details_s
+{
+    __u64 m_addr;           // buffer address
+    __u32 m_idx_fq;         // fq index
+    __u16 m_header_size;    // The size of the header
+} __attribute__((packed));
+typedef struct xdp_recv_raw_details_s xdp_recv_raw_details_t;
+#define XDP_RAW_DETAILS_POS sizeof(struct ethhdr)
+
 #include "bpf_xdp.h"
 
 #ifdef __cplusplus
