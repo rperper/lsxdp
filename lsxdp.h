@@ -64,18 +64,23 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
 xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port);
 /**
  * @fn xdp_get_socket_reqs
- * @brief Does what connect does on a regular socket, but uses a ping packet
- *        (icmp) to get ethernet address and other stuff.
+ * @brief Sets up the environment to build a socket.  You must call this once
+ * for the program but the results can be used for multiple sockets.  You must
+ * call this for both connect type sockets and accept type sockets.  For a
+ * connect type socket, uses a simple send on a socket to get the ethernet
+ * address and other stuff.  For an accept type socket, just sets up the
+ * variables.
  * @param[in] prog The program handle.
  * @param[in] addr The address (as for connect) - please put in the port!
+ *                 For accept type connections, MUST be NULL.
  * @param[in] addrLen The address length (as for connect)
  * @param[in] addr_bind An optional parameter of the local address to use.  The
  *            length is assumed to be the same as the addrLen above.
  * @param[in] ifport Optional ethernet system port to use.
  * @returns A pointer to lsxdp_socket_reqs_t if successful or NULL if not.
  * This pointer MUST be freed with a free() call when done.
- * @warning This function waits for up to 5 seconds for a ping to return.
- * If it's integrated, there will need to be event handling done!
+ * @warning This function waits for up to 5 seconds for a packet response to
+ * return. If it's integrated, there will need to be event handling done!
  **/
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const struct sockaddr *addr,

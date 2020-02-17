@@ -52,6 +52,7 @@ typedef struct lsxdp_socket_reqs_s
 {
     int               m_ifindex;
     __u16             m_port;
+    int               m_sendable;
     struct packet_rec m_rec;
 } lsxdp_socket_reqs_t;
 

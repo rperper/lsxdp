@@ -318,7 +318,6 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port)
 {
     xdp_socket_t *socket;
 
-    detach_ping(prog, 0); // Incompatible with sockets
     socket = malloc(sizeof(xdp_socket_t));
     if (!socket)
     {
@@ -351,10 +350,8 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port)
     return socket;
 }
 
-static int load_obj(xdp_prog_t *prog, const char *ifport)
+static int check_if(xdp_prog_t *prog, const char *ifport, int *enabled_ifindex)
 {
-	int err;
-	struct bpf_program *bpf_prog;
     int i;
     int enabled_one = 0;
 
@@ -371,6 +368,31 @@ static int load_obj(xdp_prog_t *prog, const char *ifport)
         }
         else if (ifport)
             prog->m_if[i].m_disable = 0;
+        if (!prog->m_if[i].m_disable)
+        {
+            *enabled_ifindex = i;
+            enabled_one = 1;
+        }
+    }
+    if (!enabled_one)
+    {
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "No interfaces enabled, you must specify an interface");
+        return -1;
+    }
+    return 0;
+}
+
+
+static int load_obj(xdp_prog_t *prog, const char *ifport)
+{
+	int err;
+	struct bpf_program *bpf_prog;
+    int i;
+    int enabled_one = 0;
+
+    for (i = 1; i <= prog->m_max_if; ++i)
+    {
         if (prog->m_if[i].m_bpf_object)
             return 0; // Already done!
         DEBUG_MESSAGE("For prog[%d], if: %d, name: %s\n", i,
@@ -550,6 +572,22 @@ static int set_map(xdp_prog_t *prog, const struct sockaddr *addr,
     return 0;
 }
 
+static lsxdp_socket_reqs_t *malloc_reqs(xdp_prog_t *prog, int ifindex)
+{
+    lsxdp_socket_reqs_t *reqs;
+    reqs = malloc(sizeof(lsxdp_socket_reqs_t));
+    if (!reqs)
+    {
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Insufficient memory to allocate required data");
+        return NULL;
+    }
+    memset(reqs, 0, sizeof(*reqs));
+    reqs->m_ifindex = ifindex;
+    return reqs;
+}
+
+
 static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                                       const struct sockaddr *addr,
                                       socklen_t addrLen)
@@ -598,16 +636,12 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                  "Can not find map entry of successful connect");
         return NULL;
     }
-    reqs = malloc(sizeof(lsxdp_socket_reqs_t));
-    if (!reqs)
-    {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Insufficient memory to allocate required data");
+    if (!(reqs = malloc_reqs(prog, found_index)))
         return NULL;
-    }
-    reqs->m_ifindex = found_index;
+    reqs->m_sendable = 1;
     reqs->m_port = ((struct sockaddr_in *)addr)->sin_port;
     memcpy(&reqs->m_rec, &rec, sizeof(rec));
+    detach_ping(prog, 0); // Incompatible with sockets
     return reqs;
 }
 
@@ -618,7 +652,17 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const char *ifport)
 {
     lsxdp_socket_reqs_t *reqs;
+    int enabled_if;
 
+    DEBUG_MESSAGE("xdp_get_socket_reqs - check_if\n");
+    if (check_if(prog, ifport, &enabled_if))
+        return NULL;
+    if (!addr)
+    {
+        reqs = malloc_reqs(prog, enabled_if);
+        reqs->m_sendable = 0;
+        return reqs;
+    }
     DEBUG_MESSAGE("xdp_get_socket_reqs - load_obj\n");
     if (load_obj(prog, ifport))
         return NULL;
@@ -780,6 +824,13 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last)
     char *send_buffer;
     char *data_char = data;
 
+    if (!sock->m_reqs->m_sendable)
+    {
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "This socket can not yet be used for sending (must be setup"
+                 " as documented");
+        return -1;
+    }
     if (data_char > (char *)sock->m_umem->buffer &&
         data_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES)
     {
