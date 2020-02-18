@@ -2,6 +2,7 @@
 
 #include "lsxdp.h"
 
+#include "ifaddrs.h"
 #include "libbpf/src/bpf.h"
 #include "poll.h"
 #include <linux/if_ether.h>
@@ -350,26 +351,95 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port)
     return socket;
 }
 
-static int check_if(xdp_prog_t *prog, const char *ifport, int *enabled_ifindex)
+static int addr_bind_to_ifport(xdp_prog_t *prog,
+                               const struct sockaddr *addr_bind,
+                               char ifport[])
+{
+    struct ifaddrs *ifaddrs;
+    struct ifaddrs *ifa;
+    if (!addr_bind)
+    {
+        DEBUG_MESSAGE("addr_bind_to_ifport NO addr_bind specified\n");
+        ifport[0] = 0;
+        return 0;
+    }
+    if (getifaddrs(&ifaddrs))
+    {
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Can't get addresses list, specify ifport name: %s",
+                 strerror(errno));
+        return -1;
+    }
+    ifa = ifaddrs;
+    while (ifa)
+    {
+        if (((struct sockaddr_in *)addr_bind)->sin_family == ((struct sockaddr_in *)ifa->ifa_addr)->sin_family &&
+            ((((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET &&
+              ((struct sockaddr_in *)addr_bind)->sin_addr.s_addr == ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr) ||
+             (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET6 &&
+              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[0] &&
+              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[1] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[1] &&
+              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[2] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[2] &&
+              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[3] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[3])))
+        {
+            if (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET)
+                DEBUG_MESSAGE("Found addr_bind addr %u.%u.%u.%u on %s\n",
+                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[0],
+                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[1],
+                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[2],
+                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[3],
+                              ifa->ifa_name);
+            else
+                DEBUG_MESSAGE("Found addr_bind addr (v6) on %s\n", ifa->ifa_name);
+            strcpy(ifport, ifa->ifa_name);
+            break;
+        }
+        else
+            ifa = ifa->ifa_next;
+    }
+    if (!ifa)
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Bind address not found in list of interfaces - respecify");
+    freeifaddrs(ifaddrs);
+    return ((ifa == NULL) ? -1 : 0);
+}
+
+static int check_if(xdp_prog_t *prog, const char *ifport,
+                    const struct sockaddr *addr_bind, int *enabled_ifindex)
 {
     int i;
     int enabled_one = 0;
+    char ifp[IF_NAMESIZE];
 
+    if (!ifport || !ifport[0])
+    {
+        if (addr_bind_to_ifport(prog, addr_bind, ifp))
+            return -1;
+        ifport = ifp;
+    }
     for (i = 1; i <= prog->m_max_if; ++i)
     {
-        if (!prog->m_if[i].m_ifname[0] || (!ifport && prog->m_if[i].m_disable))
+        if (!prog->m_if[i].m_ifname[0] ||
+            ((!ifport || !ifport[0]) && prog->m_if[i].m_disable))
             continue;
-        if (ifport && strcmp(ifport, prog->m_if[i].m_ifname))
+        if (ifport && ifport[0] && strcmp(ifport, prog->m_if[i].m_ifname))
         {
-            DEBUG_MESSAGE("ifport specified and %s does not match, disabling\n",
-                          prog->m_if[i].m_ifname);
+            DEBUG_MESSAGE("ifport specified (%s) and %s does not match, disabling\n",
+                          ifport, prog->m_if[i].m_ifname);
             prog->m_if[i].m_disable = 1;
             continue;
         }
-        else if (ifport)
+        else if (ifport && ifport[0])
             prog->m_if[i].m_disable = 0;
         if (!prog->m_if[i].m_disable)
         {
+            if (enabled_one)
+            {
+                snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                         "Attempt to bind to more than one interface specify a "
+                         "specific interface or bind-to address");
+                return -1;
+            }
             *enabled_ifindex = i;
             enabled_one = 1;
         }
@@ -641,7 +711,6 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
     reqs->m_sendable = 1;
     reqs->m_port = ((struct sockaddr_in *)addr)->sin_port;
     memcpy(&reqs->m_rec, &rec, sizeof(rec));
-    detach_ping(prog, 0); // Incompatible with sockets
     return reqs;
 }
 
@@ -655,7 +724,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
     int enabled_if;
 
     DEBUG_MESSAGE("xdp_get_socket_reqs - check_if\n");
-    if (check_if(prog, ifport, &enabled_if))
+    if (check_if(prog, ifport, addr_bind, &enabled_if))
         return NULL;
     if (!addr)
     {
@@ -668,14 +737,23 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
         return NULL;
     DEBUG_MESSAGE("xdp_get_socket_reqs - set_map\n");
     if (set_map(prog, addr, addrLen) == -1)
+    {
+        detach_ping(prog, 0);
         return NULL;
+    }
     DEBUG_MESSAGE("xdp_get_socket_reqs - send_tcp\n");
     if (send_connect(prog, addr, addrLen, addr_bind))
+    {
+        detach_ping(prog, 0);
         return NULL;
+    }
     DEBUG_MESSAGE("xdp_get_socket_reqs - check_map\n");
     reqs = check_map(prog, addr, addrLen);
     if (!reqs)
+    {
+        detach_ping(prog, 0);
         return NULL;
+    }
     DEBUG_MESSAGE("xdp_get_socket_reqs - WORKED! header size %d "
                   "source mac: %02x:%02x:%02x:%02x:%02x:%02x "
                   "dest mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -692,6 +770,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[3],
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[4],
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[5]);
+    detach_ping(prog, 0);
     return reqs;
 }
 
