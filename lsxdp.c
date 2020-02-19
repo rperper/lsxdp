@@ -357,7 +357,7 @@ static int addr_bind_to_ifport(xdp_prog_t *prog,
 {
     struct ifaddrs *ifaddrs;
     struct ifaddrs *ifa;
-    if (!addr_bind)
+    if (!addr_bind || !addr_bind->sa_family)
     {
         DEBUG_MESSAGE("addr_bind_to_ifport NO addr_bind specified\n");
         ifport[0] = 0;
