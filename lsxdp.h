@@ -88,6 +88,20 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const struct sockaddr *addr_bind,
                                          const char *ifport);
 /**
+ * @fn xdp_get_local_addr
+ * @brief Given a lsxdp_socket_reqs_t * returns the address bound to.
+ * @param[in] prog The program handle.
+ * @param[in] reqs The previously returned lsxdp_socket_reqs *
+ * @param[in] ipv4 1 for ipv4 address; 0 for ipv6 address.
+ * @param[out] addr The address that was bound to.
+ * @returns -1 if the address couldn't be found; 0 if it could.
+ **/
+int xdp_get_local_addr(xdp_prog_t *prog,
+                       lsxdp_socket_reqs_t *reqs,
+                       int ipv4,
+                       struct sockaddr *addr);
+
+/**
  * @fn xdp_get_poll_fd
  * @brief The the fd that can be used to determine if it's ok to send/recv now.
  * @param[in] sock The socket to get the fd for.

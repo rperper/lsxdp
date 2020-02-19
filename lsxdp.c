@@ -9,10 +9,10 @@
 #include "linux/in.h"
 #include "linux/icmp.h"
 
-#define TRACE_BUFFER_PRINTF
-#include "traceBuffer.h"
+#define DEBUG_MESSAGE(...) fprintf(stderr, __VA_ARGS__)
 
-#define DEBUG_MESSAGE(...) printf(__VA_ARGS__)
+#define TRACE_BUFFER_DEBUG_MESSAGE
+#include "traceBuffer.h"
 
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not set */
                            /*XDP_FLAGS_SKB_MODE | // Generic or emulated (slow)*/
@@ -404,6 +404,45 @@ static int addr_bind_to_ifport(xdp_prog_t *prog,
     return ((ifa == NULL) ? -1 : 0);
 }
 
+static int ifport_to_addr_bind(xdp_prog_t *prog,
+                               const char ifport[],
+                               int ipv4,
+                               struct sockaddr *addr_bind)
+{
+    struct ifaddrs *ifaddrs;
+    struct ifaddrs *ifa;
+    if (getifaddrs(&ifaddrs))
+    {
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Can't getifaddrs() for getting address of port: %s",
+                 strerror(errno));
+        return -1;
+    }
+    ifa = ifaddrs;
+    while (ifa)
+    {
+        if (!strcmp(ifport, ifa->ifa_name))
+        {
+            if (ipv4 && ((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET)
+            {
+                memcpy(addr_bind, ifa->ifa_addr, sizeof(struct sockaddr_in));
+                break;
+            }
+            else if (!ipv4 && ((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET6)
+            {
+                memcpy(addr_bind, ifa->ifa_addr, sizeof(struct sockaddr_in6));
+                break;
+            }
+        }
+        ifa = ifa->ifa_next;
+    }
+    if (!ifa)
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "ifname not found in list of interfaces - respecify");
+    freeifaddrs(ifaddrs);
+    return ((ifa == NULL) ? -1 : 0);
+}
+
 static int check_if(xdp_prog_t *prog, const char *ifport,
                     const struct sockaddr *addr_bind, int *enabled_ifindex)
 {
@@ -774,6 +813,15 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
     return reqs;
 }
 
+int xdp_get_local_addr(xdp_prog_t *prog,
+                       lsxdp_socket_reqs_t *reqs,
+                       int ipv4,
+                       struct sockaddr *addr)
+{
+    return ifport_to_addr_bind(prog, prog->m_if[reqs->m_ifindex].m_ifname, ipv4,
+                               addr);
+}
+
 void xdp_prog_done ( xdp_prog_t* prog, int unload, int force_unload )
 {
     if (!prog)
@@ -893,6 +941,8 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
                  "Unable to reserve a packet for a full frame size.  Poll?");
         return NULL;
     }
+    DEBUG_MESSAGE("Using header: (header size: %d)\n", sock->m_reqs->m_rec.m_header_size);
+    traceBuffer(sock->m_reqs->m_rec.m_header, xdp_send_udp_headroom(sock));
     memcpy(buffer, sock->m_reqs->m_rec.m_header, xdp_send_udp_headroom(sock));
     return (void *)((char *)buffer + xdp_send_udp_headroom(sock));
 }
@@ -1053,8 +1103,10 @@ int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len, int *header_pos)
         DEBUG_MESSAGE("Recv buffer too small for UDP\n");
         return 1;
     }
-    if (udp->dest != sock->m_reqs->m_port)
+    if (udp->dest && udp->dest != sock->m_reqs->m_port)
     {
+        /* Check both send and recv ports because I don't know an ACK from a
+         * true receive (for now).  */
         DEBUG_MESSAGE("Recv port mismatch (%d != %d)\n",
                       __constant_htons(udp->dest),
                       __constant_htons(sock->m_reqs->m_port));

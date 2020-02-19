@@ -42,7 +42,9 @@ static void traceBuffer(const char *buf, int sz)
         buf_idx++;
         buffer[buf_idx] = 0;
     }
-#ifdef TRACE_BUFFER_PRINTF
+#ifdef TRACE_BUFFER_DEBUG_MESSAGE
+    DEBUG_MESSAGE("Tracing %d bytes:\n%s", sz, buffer);
+#elif defined(TRACE_BUFFER_PRINTF)
     printf("Tracing %d bytes:\n%s", sz, buffer);
 #else
     LS_DBG_L("Tracing %d bytes:\n%s", sz, buffer);
