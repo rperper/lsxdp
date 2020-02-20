@@ -51,25 +51,28 @@ int xdp_link_detach(xdp_prog_t *prog, int ifindex, __u32 xdp_flags,
 	__u32 curr_prog_id;
 	int err;
 
-	err = bpf_get_link_xdp_id(ifindex, &curr_prog_id, xdp_flags);
-	if (err)
+    if (expected_prog_id)
     {
-		snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "ERR: get link xdp id failed (err=%d): %s\n",
-			     -err, strerror(-err));
-		return -1;
-	}
+        err = bpf_get_link_xdp_id(ifindex, &curr_prog_id, xdp_flags);
+        if (err)
+        {
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                    "ERR: get link xdp id failed (err=%d): %s\n",
+                    -err, strerror(-err));
+            return -1;
+        }
 
-	if (!curr_prog_id)
-		return 0;
+        if (!curr_prog_id)
+            return 0;
 
-	if (expected_prog_id && curr_prog_id != expected_prog_id)
-    {
-		snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-			     "Expected prog ID(%d) no match(%d), not removing",
-			     expected_prog_id, curr_prog_id);
-		return -1;
-	}
+        if (curr_prog_id != expected_prog_id)
+        {
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "Expected prog ID(%d) no match(%d), not removing",
+			         expected_prog_id, curr_prog_id);
+            return -1;
+        }
+    }
 
 	if ((err = bpf_set_link_xdp_fd(ifindex, -1, xdp_flags)) < 0)
     {

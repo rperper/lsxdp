@@ -49,6 +49,14 @@ extern "C" {
 xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
                           int max_frame_size);
 /**
+ * @fn xdp_debug
+ * @brief Allows you to turn on/off debugging.  It sets a static so it can be
+ *        done anytime.
+ * @param[in] on Whether you want it on or off.
+ * @returns None.
+ **/
+void xdp_debug(int on);
+/**
  * @fn xdp_socket
  * @brief Call to create a socket to a remote system
  * @param[in] prog The return from xdp_prog_init
@@ -131,9 +139,13 @@ void *xdp_get_send_buffer(xdp_socket_t *sock);
  * the supplied packet length.
  * @param[in] last 1 if this is the last (kick it now) or 0 if there are more
  * to send.
+ * @param[in] addr Actually only the port is used (the socket has to already
+ * have the IP address) and the port is the destination port if set to deal with
+ * NAT devices.
  * @returns -1 for an error or 0 for success.
  **/
-int xdp_send(xdp_socket_t *sock, void *data, int len, int last);
+int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
+             struct sockaddr *addr);
 
 /**
  * @fn xdp_send_zc
@@ -145,9 +157,13 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last);
  * @param[in] len The length of the data to send (not including the headroom).
  * @param[in] last 1 if this is the last (kick it now) or 0 if there are more
  * to send.
+ * @param[in] addr Actually only the port is used (the socket has to already
+ * have the IP address) and the port is the destination port if set to deal with
+ * NAT devices.
  * @returns -1 for an error or 0 for success.
  **/
-int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last);
+int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
+                struct sockaddr *addr);
 
 /**
  * @fn xdp_send_completed

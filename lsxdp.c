@@ -9,7 +9,9 @@
 #include "linux/in.h"
 #include "linux/icmp.h"
 
-#define DEBUG_MESSAGE(...) fprintf(stderr, __VA_ARGS__)
+static int s_xdp_debug = 1;
+#define DEBUG_ON    s_xdp_debug
+#define DEBUG_MESSAGE(...) if (s_xdp_debug) fprintf(stderr, __VA_ARGS__)
 
 #define TRACE_BUFFER_DEBUG_MESSAGE
 #include "traceBuffer.h"
@@ -24,6 +26,11 @@ static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
                                   /* XDP_ZEROCOPY | // Force zero copy */
                                   0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
 static u32 s_pending_recv = XSK_RING_PROD__DEFAULT_NUM_DESCS / 2;
+
+void xdp_debug(int on)
+{
+    s_xdp_debug = on;
+}
 
 static int xsk_configure_umem(void *buffer, xdp_socket_t *sock, u64 size)
 {
@@ -308,7 +315,7 @@ static int xsk_load_kern(xdp_socket_t *sock)
         if (ret < 0)
         {
             snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "Kernel load error bpf_set_link_xdp_id: %s", strerror(-ret));
+                     "Kernel load error bpf_set_link_xdp_fd: %s", strerror(-ret));
             return -1;
 	    }
     }
@@ -504,9 +511,15 @@ static int load_obj(xdp_prog_t *prog, const char *ifport)
     {
         if (prog->m_if[i].m_bpf_object)
             return 0; // Already done!
+
+        if (prog->m_if[i].m_disable)
+            continue;
+
         DEBUG_MESSAGE("For prog[%d], if: %d, name: %s\n", i,
                       if_nametoindex(prog->m_if[i].m_ifname),
                       prog->m_if[i].m_ifname);
+        prog->m_if[i].m_ping_attached = 0;
+
         struct bpf_prog_load_attr prog_load_attr =
         {
             .prog_type = BPF_PROG_TYPE_XDP,
@@ -557,6 +570,8 @@ static int load_obj(xdp_prog_t *prog, const char *ifport)
         err = xdp_link_attach(prog, i, opt_xdp_flags, prog->m_if[i].m_progfd);
         if (err)
         {
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "ERR: xdp_link_attach failed: %s", strerror(-err));
             prog->m_if[i].m_disable = 1;
             continue;
         }
@@ -765,6 +780,12 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
     DEBUG_MESSAGE("xdp_get_socket_reqs - check_if\n");
     if (check_if(prog, ifport, addr_bind, &enabled_if))
         return NULL;
+
+    DEBUG_MESSAGE("xdp_get_socket_reqs - forcably detach any loaded XDP progs "
+                  "on if #%d!\n", enabled_if);
+    if (xdp_link_detach(prog, enabled_if, opt_xdp_flags, 0))
+        DEBUG_MESSAGE("xdp_link_detach failed: %s\n", prog->m_err);
+
     if (!addr)
     {
         reqs = malloc_reqs(prog, enabled_if);
@@ -902,6 +923,7 @@ static int tx_only(xdp_socket_t *sock, void *buffer, int len, int last)
         return -1;
     }
     desc = xsk_ring_prod__tx_desc(&sock->m_sock_info->tx, idx);
+    DEBUG_MESSAGE("tx_only:\n");
     traceBuffer(buffer, len);
     desc->addr = get_index_from_buffer(sock, buffer) * sock->m_xdp_prog->m_max_frame_size;
     desc->len = len;
@@ -947,7 +969,8 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
     return (void *)((char *)buffer + xdp_send_udp_headroom(sock));
 }
 
-int xdp_send(xdp_socket_t *sock, void *data, int len, int last)
+int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
+             struct sockaddr *addr)
 {
     int headroom = xdp_send_udp_headroom(sock);
     char *send_buffer;
@@ -974,14 +997,16 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last)
             return -1;
         memcpy(send_buffer + headroom, data, len);
     }
-    return xdp_send_zc(sock, send_buffer, len, last);
+    return xdp_send_zc(sock, send_buffer, len, last, addr);
 }
 
-int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last)
+int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
+                struct sockaddr *addr)
 {
     int ip_index;
     struct udphdr *udphdr;
     char *buffer_char = buffer;
+    __u16 port = sock->m_reqs->m_port;
     int headroom = xdp_send_udp_headroom(sock);
     if (buffer_char >= (char *)sock->m_umem->buffer &&
         buffer_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES &&
@@ -1005,6 +1030,11 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last)
         iphdr->protocol = 17; // UDP
         iphdr->check = 0;
         iphdr->check = checksum(iphdr, sizeof(struct iphdr));
+        if (addr && ((struct sockaddr_in *)addr)->sin_port)
+        {
+            port = ((struct sockaddr_in *)addr)->sin_port;
+            DEBUG_MESSAGE("Override port to %d", __constant_htons(port));
+        }
         udphdr = (struct udphdr *)(iphdr + 1);
     }
     else
@@ -1013,10 +1043,15 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last)
         ipv6hdr->payload_len = __constant_htons(sizeof(struct udphdr) + len);
         ipv6hdr->nexthdr = 17; // UDP
         ipv6hdr->hop_limit = 20;
+        if (addr && ((struct sockaddr_in6 *)addr)->sin6_port)
+        {
+            port = ((struct sockaddr_in6 *)addr)->sin6_port;
+            DEBUG_MESSAGE("Override port to %d (ipv6)", __constant_htons(port));
+        }
         udphdr = (struct udphdr *)(ipv6hdr + 1);
     }
-    udphdr->source = 0;
-    udphdr->dest = sock->m_reqs->m_port;
+    udphdr->source = sock->m_reqs->m_port;
+    udphdr->dest = port;
     udphdr->len = __constant_htons(sizeof(*udphdr) + len);
     udphdr->check = 0;
     if (!sock->m_reqs->m_rec.m_ip4)
@@ -1095,7 +1130,8 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
     return 0;
 }
 
-int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len, int *header_pos)
+int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len, int *header_pos,
+    struct sockaddr *addr)
 {
     struct udphdr *udp = (struct udphdr *)((unsigned char *)pkt + *header_pos);
     if (*header_pos + sizeof(struct udphdr) > *len)
@@ -1119,6 +1155,14 @@ int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len, int *header_pos)
                  *len, (*header_pos) + __constant_htons(udp->len));
         return -1;
     }
+    if (addr)
+    {
+        if (((struct sockaddr_in *)addr)->sin_family == AF_INET)
+            ((struct sockaddr_in *)addr)->sin_port = udp->source;
+        else
+            ((struct sockaddr_in6 *)addr)->sin6_port = udp->source;
+    }
+    DEBUG_MESSAGE("Recv source port %d)\n",  __constant_htons(udp->source));
     *len = (*header_pos) + __constant_htons(udp->len);
     *header_pos += sizeof(struct udphdr);
     return 0;
@@ -1132,6 +1176,60 @@ static void recv_return_raw(xdp_socket_t *sock, u32 idx_fq, u64 addr)
 	sock->m_sock_info->rx_npkts += 1;
 }
 
+
+void rebuild_header(xdp_socket_t *sock, char *pkt, struct sockaddr *sockaddr)
+{
+    int header_pos;
+
+    sock->m_reqs->m_sendable = 1;
+    sock->m_reqs->m_rec.m_addr_set = 1;
+    sock->m_reqs->m_rec.m_ip4 = ((struct sockaddr_in *)sockaddr)->sin_family == AF_INET;
+    if (sock->m_reqs->m_rec.m_ip4)
+        memcpy(&sock->m_reqs->m_rec.m_addr.in6_u.u6_addr32[0],
+               &((struct sockaddr_in *)sockaddr)->sin_addr, 4);
+    else
+        memcpy(&sock->m_reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
+    // m_port has already been set.
+    sock->m_reqs->m_rec.m_ip_index = sizeof(struct ethhdr);
+    sock->m_reqs->m_rec.m_header_size = xdp_send_udp_headroom(sock);
+    memcpy(sock->m_reqs->m_rec.m_header, pkt, sock->m_reqs->m_rec.m_header_size);
+    DEBUG_MESSAGE("recv, build sendable header %s, raw:\n",
+                  sock->m_reqs->m_rec.m_ip4 ? "ipv4" : "ipv6");
+    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
+    // Reverse the fields where appropriate.
+    memcpy(sock->m_reqs->m_rec.m_header, ((struct ethhdr *)pkt)->h_source,
+           sizeof(((struct ethhdr *)pkt)->h_source));
+    memcpy(((struct ethhdr *)sock->m_reqs->m_rec.m_header)->h_source, pkt,
+           sizeof(((struct ethhdr *)pkt)->h_source));
+    header_pos = sizeof(struct ethhdr);
+    if (sock->m_reqs->m_rec.m_ip4)
+    {
+        struct iphdr *iphdr_save, *iphdr_pkt;
+        iphdr_save = (struct iphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
+        iphdr_pkt = (struct iphdr *)(pkt + header_pos);
+        iphdr_save->saddr = iphdr_pkt->daddr;
+        iphdr_save->daddr = iphdr_pkt->saddr;
+        header_pos += sizeof(struct iphdr);
+    }
+    else
+    {
+        struct ipv6hdr *ipv6hdr_save, *ipv6hdr_pkt;
+        ipv6hdr_save = (struct ipv6hdr *)(sock->m_reqs->m_rec.m_header + header_pos);
+        ipv6hdr_pkt = (struct ipv6hdr *)(pkt + header_pos);
+        memcpy(&ipv6hdr_save->saddr, &ipv6hdr_pkt->daddr, sizeof(struct in6_addr));
+        memcpy(&ipv6hdr_save->daddr, &ipv6hdr_pkt->saddr, sizeof(struct in6_addr));
+        header_pos += sizeof(struct ipv6hdr);
+    }
+    {
+        struct udphdr *udphdr_save, *udphdr_pkt;
+        udphdr_save = (struct udphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
+        udphdr_pkt = (struct udphdr *)(pkt + header_pos);
+        udphdr_save->source = udphdr_pkt->dest;
+        udphdr_save->dest = udphdr_pkt->source;
+        header_pos += sizeof(struct udphdr);
+    }
+    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
+}
 
 int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr,
              socklen_t *addrlen)
@@ -1166,6 +1264,7 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
         int header_pos = 0;
         xdp_recv_raw_details_t *details;
 
+        DEBUG_MESSAGE("Recv raw packet:\n");
         traceBuffer(pkt, len);
         res = parse_recv_ip_hdr(sock, pkt, len, &header_pos, sockaddr, addrlen);
         if (res == -1)
@@ -1175,7 +1274,7 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
             recv_return_raw(sock, idx_fq, addr);
             continue;
         }
-        res = parse_recv_udp_hdr(sock, pkt, &len, &header_pos);
+        res = parse_recv_udp_hdr(sock, pkt, &len, &header_pos, sockaddr);
         if (res == -1)
             return -1;
         else if (res == 1)
@@ -1183,6 +1282,9 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
             recv_return_raw(sock, idx_fq, addr);
             continue;
         }
+        if (!sock->m_reqs->m_sendable)
+            rebuild_header(sock, pkt, sockaddr);
+
         details = (xdp_recv_raw_details_t *)(pkt + XDP_RAW_DETAILS_POS);
         details->m_idx_fq = idx_fq;
         details->m_addr = addr;
@@ -1192,6 +1294,7 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
         DEBUG_MESSAGE("recv, data: %p, buffer: %p, details: %p\n", data, pkt,
                       details);
         traceBuffer(*data, *sz);
+
         return 0;
     }
     DEBUG_MESSAGE("No UDP data\n");

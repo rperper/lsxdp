@@ -21,7 +21,7 @@ void usage()
 }
 
 
-int do_send(xdp_prog_t *prog, xdp_socket_t *sock)
+int do_send(xdp_prog_t *prog, xdp_socket_t *sock, struct sockaddr_in6 *sa)
 {
     int      ret = 0;
     void    *send_buffer = NULL;
@@ -61,10 +61,12 @@ int do_send(xdp_prog_t *prog, xdp_socket_t *sock)
         {
             strcpy(send_buffer, "Test string!");
             strcpy(send_buffer2, "The second send buffer.");
-            ret = xdp_send(sock, send_buffer, strlen(send_buffer), 0);
+            ret = xdp_send(sock, send_buffer, strlen(send_buffer), 0,
+                           (struct sockaddr *)sa);
             if (ret)
                 printf("Error sending send_buffer: %s\n", xdp_get_last_error(prog));
-            else if ((ret = xdp_send(sock, send_buffer2, strlen(send_buffer2), 1)))
+            else if ((ret = xdp_send(sock, send_buffer2, strlen(send_buffer2), 1,
+                                     (struct sockaddr *)sa)))
                 printf("Error sending send_buffer2: %s\n", xdp_get_last_error(prog));
             else
             {
@@ -99,7 +101,7 @@ int do_send(xdp_prog_t *prog, xdp_socket_t *sock)
 }
 
 
-int do_recv(xdp_prog_t *prog, xdp_socket_t *sock)
+int do_recv(xdp_prog_t *prog, xdp_socket_t *sock, struct sockaddr_in6 *sa)
 {
     int      ret = 0;
     struct pollfd fds[2];
@@ -132,12 +134,11 @@ int do_recv(xdp_prog_t *prog, xdp_socket_t *sock)
         else
         {
             void *buffer;
-            struct sockaddr_in6 sa;
-            int sa_len = sizeof(sa);
+            int sa_len = sizeof(*sa);
             int sz;
             ret = 0;
             printf("\nPoll successful (ret: %d), doing receive\n", ret);
-            ret = xdp_recv(sock, &buffer, &sz, (struct sockaddr *)&sa, &sa_len);
+            ret = xdp_recv(sock, &buffer, &sz, (struct sockaddr *)sa, &sa_len);
             if (ret)
             {
                 printf("Error in xdp_recv: %s\n", xdp_get_last_error(prog));
@@ -175,7 +176,9 @@ int main(int argc, char **argv)
     char            *port = "80";
     char            *addr_bin = NULL;
     char             recv_only = 0;
-    
+    struct sockaddr_in6 sa_comm;
+
+    memset(&sa_comm, 0, sizeof(sa_comm));
     while ((opt = getopt(argc, argv, "b:e:i:nop:rw")) != -1)
     {
         switch (opt)
@@ -266,9 +269,9 @@ int main(int argc, char **argv)
                 printf("xdp_socket successful\n");
         }
         if (!ret && !recv_only)
-            ret = do_send(prog, sock);
+            ret = do_send(prog, sock, &sa_comm);
         if (!ret && recv_only)
-            ret = do_recv(prog, sock);
+            ret = do_recv(prog, sock, &sa_comm);
         if (pause)
         {
             char input[80];

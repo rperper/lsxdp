@@ -5,6 +5,10 @@ static void traceBuffer(const char *buf, int sz)
     buffer[0] = 0;
     unsigned char *in = (unsigned char *)buf;
     int  buf_idx = 0;
+#ifdef DEBUG_ON
+    if (!DEBUG_ON)
+        return;
+#endif
     if (sz > 0xffff)
         sz = 0xffff;
     for (int i = 0; i < sz; i = i + 16)
