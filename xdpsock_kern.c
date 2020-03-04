@@ -127,17 +127,11 @@ struct ethhdr_simple
 	__be16		h_proto;		/* packet type ID field	*/
 } __attribute__((packed));
 
-static __always_inline int copy_ethhdr(void *src_end, void *dest_end,
+static __always_inline int copy_ethhdr(void *dest_end,
                                        struct ethhdr_simple *dest,
                                        struct ethhdr_simple *src)
 {
     char *cpdest = (char *)dest;
-    char *cpsrc = (char *)src;
-    if (cpsrc + sizeof(struct ethhdr_simple) >= (char *)src_end)
-    {
-        bpf_printk("copy_ethhdr, source out of range\n");
-        return -1;
-    }
     if (cpdest + sizeof(struct ethhdr_simple) >= (char *)dest_end)
     {
         bpf_printk("copy_ethhdr, dest out of range\n");
@@ -147,11 +141,40 @@ static __always_inline int copy_ethhdr(void *src_end, void *dest_end,
     dest->dest_addr2 = src->src_addr2;
     dest->src_addr1 = src->dest_addr1;
     dest->src_addr2 = src->dest_addr2;
-    dest->h_proto = src->h_proto;
+	dest->h_proto = src->h_proto;
     return 0;
 }
 
-/*
+static __always_inline int copy_vlan(__u16 proto, void *dest_end,
+                                     struct vlan_hdr *dest,
+                                     struct vlan_hdr *src)
+{
+    char *cpdest = (char *)dest;
+    int i;
+
+    if (cpdest + sizeof(struct vlan_hdr) * VLAN_MAX_DEPTH >= (char *)dest_end)
+    {
+        bpf_printk("copy_vlan, dest out of range\n");
+        return -1;
+    }
+	#pragma unroll
+	for (i = 0; i < VLAN_MAX_DEPTH; i++)
+    {
+		if (!proto_is_vlan(proto))
+			break;
+
+		if (dest + 1 > dest_end)
+			break;
+
+        dest->h_vlan_TCI = src->h_vlan_TCI;
+        dest->h_vlan_encapsulated_proto = src->h_vlan_encapsulated_proto;
+		proto = src->h_vlan_encapsulated_proto;
+		src++;
+        dest++;
+	}
+    return 0;
+}
+
 struct ipv6hdr_simple
 {
     __u64 prefix;
@@ -161,16 +184,11 @@ struct ipv6hdr_simple
     __u64 dest_addr2;
 } __attribute__((packed));
 
-static __always_inline int copy_ipv6(void *src_end, void *dest_end,
+static __always_inline int copy_ipv6(void *dest_end,
                                      struct ipv6hdr_simple *dest,
                                      struct ipv6hdr_simple *src)
 {
-    if ((char *)src + sizeof(struct ipv6hdr_simple) >= (char *)src_end)
-    {
-        bpf_printk("copy_ipv6, source out of range\n");
-        return -1;
-    }
-    if ((char *)dest + sizeof(struct ipv6hdr_simple) >= (char *)dest_end)
+    if (dest + 1 >= (struct ipv6hdr_simple *)dest_end)
     {
         bpf_printk("copy_ipv6, dest out of range\n");
         return -1;
@@ -182,7 +200,6 @@ static __always_inline int copy_ipv6(void *src_end, void *dest_end,
     dest->dest_addr2 = src->src_addr2;
     return 0;
 }
-*/
 
 struct iphdr_simple
 {
@@ -192,16 +209,11 @@ struct iphdr_simple
     __u32 dest_addr;
 } __attribute__((packed));
 
-static __always_inline int copy_ipv4(void *src_end, void *dest_end,
+static __always_inline int copy_ipv4(void *dest_end,
                                      struct iphdr_simple *dest,
                                      struct iphdr_simple *src)
 {
-    if ((char *)src + sizeof(struct iphdr_simple) >= (char *)src_end)
-    {
-        bpf_printk("copy_ipv4, source out of range\n");
-        return -1;
-    }
-    if ((char *)dest + sizeof(struct iphdr_simple) >= (char *)dest_end)
+    if ((void *)dest + sizeof(struct iphdr_simple) * 2 >= dest_end)
     {
         bpf_printk("copy_ipv4, dest out of range\n");
         return -1;
@@ -213,6 +225,7 @@ static __always_inline int copy_ipv4(void *src_end, void *dest_end,
     return 0;
 }
 
+
 SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;
@@ -221,10 +234,10 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     struct packet_rec *rec;
     int h_proto;
 	struct ethhdr *eth;
-    struct ipv6hdr *ipv6hdr;
+    struct ipv6hdr *ipv6hdr = NULL;
     struct iphdr *iphdr = NULL;
     struct tcphdr  *tcphdr;
-    int ip_index;
+    __u16 ip_index;
     void *map_end;
     int ipv4 = 0;
 
@@ -247,7 +260,7 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
 	 * header type in the packet correct?), and bounds checking.
 	 */
 	h_proto = parse_ethhdr(&nh, data_end, &eth);
-    ip_index = (int)((char *)nh.pos - (char *)data);
+    ip_index = (__u16)((char *)nh.pos - (char *)data);
     if (h_proto == bpf_htons(ETH_P_IP))
     {
         ipv4 = 1;
@@ -279,12 +292,6 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     else
     {
         bpf_printk("parse_ethhdr failed proto: %d\n", bpf_htons(h_proto));
-        goto out;
-    }
-    if (ip_index < 0 ||
-        ip_index >= MAX_PACKET_HEADER_SIZE - sizeof(struct ipv6hdr) - sizeof(struct udphdr))
-    {
-        bpf_printk("xdp_ping_func ip_index OUT OF RANGE: %d\n", ip_index);
         goto out;
     }
     header_end = nh.pos;
@@ -323,7 +330,7 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
             bpf_printk("xdp_ping_func map address wrong IP addr %u.%u",
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[0],
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[1]);
-            bpf_printk("  .%u.%u",
+            bpf_printk("  .%u.%u\n",
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[2],
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[3]);
             goto out;
@@ -331,8 +338,19 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     }
     else
     {
-        bpf_printk("xdp_ping_func ignore IPv6 for now\n");
-        goto out;
+        if (ipv6hdr->daddr.in6_u.u6_addr32[0] != rec->m_addr.in6_u.u6_addr32[0] ||
+            ipv6hdr->daddr.in6_u.u6_addr32[1] != rec->m_addr.in6_u.u6_addr32[1] ||
+            ipv6hdr->daddr.in6_u.u6_addr32[2] != rec->m_addr.in6_u.u6_addr32[2] ||
+            ipv6hdr->daddr.in6_u.u6_addr32[3] != rec->m_addr.in6_u.u6_addr32[3])
+        {
+            bpf_printk("xdp_ping_func map address wrong IPv6 addr %x:%x",
+                       rec->m_addr.in6_u.u6_addr32[0],
+                       rec->m_addr.in6_u.u6_addr32[1]);
+            bpf_printk(" :%x:%x\n",
+                       rec->m_addr.in6_u.u6_addr32[2],
+                       rec->m_addr.in6_u.u6_addr32[3]);
+            goto out;
+        }
     }
     if (tcphdr->source != rec->m_port)
     {
@@ -340,38 +358,53 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
         goto out;
     }
     rec->m_header_size = (int)(header_end - data);
-    map_end = (void *)((char *)rec + sizeof(struct packet_rec));
-    bpf_printk("Copy the ethernet header\n");
-    if (copy_ethhdr(data_end, map_end, (struct ethhdr_simple *)rec->m_header,
+    map_end = (void *)(rec->m_header + sizeof(rec->m_header));
+    bpf_printk("Copy the ethernet header, ip_index: %d\n", ip_index);
+    if (copy_ethhdr(/*data_end, */map_end, (struct ethhdr_simple *)rec->m_header,
                      (struct ethhdr_simple *)eth) == -1)
         goto out;
+    if (proto_is_vlan(eth->h_proto) &&
+        copy_vlan(eth->h_proto, map_end,
+                  (struct vlan_hdr *)(rec->m_header + sizeof(struct ethhdr_simple)),
+                  (struct vlan_hdr *)(data + sizeof(struct ethhdr_simple))) == -1)
+        goto out;
     rec->m_ip_index = ip_index;
-    //if (h_proto == bpf_htons(ETH_P_IPV6))
+    if (ip_index + sizeof(struct ipv6hdr) >= sizeof(rec->m_header))
+    {
+        bpf_printk("ip_index out of range: %d\n", ip_index);
+        goto out;
+    }
     if (!ipv4)
     {
-        bpf_printk("xdp_ping_func ignore IPv6 for now\n");
-        goto out;
-        /*
-        struct ipv6hdr_simple *map_ipv6hdr;
+        char *map_ipv6hdr;
         rec->m_ip4 = 0;
-        map_ipv6hdr = (struct ipv6hdr_simple *)(rec->m_header + sizeof(struct ethhdr));
-        if (copy_ipv6(data_end, map_end, map_ipv6hdr,
+        map_ipv6hdr = rec->m_header + ip_index;
+        bpf_printk("Copy the IPv6 header\n");
+        if (map_ipv6hdr + sizeof(struct ipv6hdr) > (char *)map_end ||
+            map_ipv6hdr < rec->m_header)
+        {
+            bpf_printk("ipv6 header out of range\n");
+            goto out;
+        }
+        if (copy_ipv6(map_end,
+                      (struct ipv6hdr_simple *)map_ipv6hdr,
                       (struct ipv6hdr_simple *)ipv6hdr) == -1)
             goto out;
-        */
     }
     else
     {
-        struct iphdr_simple *map_iphdr;
+        char *map_iphdr;
         rec->m_ip4 = 1;
-        map_iphdr = (struct iphdr_simple *)(rec->m_header + sizeof(struct ethhdr));
+        map_iphdr = rec->m_header + ip_index;
         bpf_printk("Copy the IPv4 header\n");
-        if (!iphdr)
+        if (map_iphdr + sizeof(struct iphdr_simple) > (char *)map_end ||
+            map_iphdr < rec->m_header)
         {
-            bpf_printk("xdp_ping_func UNEXPECTED UNINITIALIZED iphdr\n");
+            bpf_printk("ipv4 header out of range\n");
             goto out;
         }
-        if (copy_ipv4(data_end, map_end, map_iphdr,
+        if (copy_ipv4(map_end,
+                      (struct iphdr_simple *)map_iphdr,
                       (struct iphdr_simple *)iphdr) == -1)
             goto out;
     }

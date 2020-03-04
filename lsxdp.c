@@ -721,6 +721,7 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
     int found_index = 0;
     lsxdp_socket_reqs_t *reqs;
 
+    DEBUG_MESSAGE("In check_map\n");
     for (i = 1; i <= prog->m_max_if; ++i)
     {
         if (!prog->m_if[i].m_disable &&
@@ -728,10 +729,14 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
         {
             int map_fd;
             int key = 0; // Separate maps for each IF for now, all with key 0
+            DEBUG_MESSAGE("check_map, if: %d\n", i);
             map_fd = find_map_fd(prog, prog->m_if[i].m_bpf_object,
                                  "packet_rec_def");
             if (map_fd == -1)
+            {
+                DEBUG_MESSAGE("map_fd == -1!!!\n");
                 return NULL;
+            }
             int rc = bpf_map_lookup_elem(map_fd, &key, &rec);
             if ((rc == 0 && rec.m_ip4 &&
                 ((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr == ((struct sockaddr_in *)addr)->sin_addr.s_addr))
@@ -742,20 +747,31 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                 break;
             }
             else if (rc != 0)
+            {
                 DEBUG_MESSAGE("bpf_map_lookup_elem failed: %d\n", errno);
+            }
+            else if (!rec.m_header_size)
+            {
+                DEBUG_MESSAGE("Response not found (no header received)\n");
+            }
             else if (rec.m_ip4)
+            {
                 DEBUG_MESSAGE("Unexpected IP daddr: %u.%u.%u.%u\n",
                               ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[0],
                               ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[1],
                               ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[2],
                               ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[3]);
+                traceBuffer(rec.m_header, rec.m_header_size);
+            }
             else
+            {
                 DEBUG_MESSAGE("NOT IP 4!\n");
-
+            }
         }
     }
     if (!found_index)
     {
+        DEBUG_MESSAGE("Can't find map entry of successful connect\n");
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "Can not find map entry of successful connect");
         return NULL;
@@ -830,6 +846,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[3],
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[4],
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[5]);
+    traceBuffer(reqs->m_rec.m_header, reqs->m_rec.m_header_size);
     detach_ping(prog, 0);
     return reqs;
 }
@@ -1033,7 +1050,7 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
         if (addr && ((struct sockaddr_in *)addr)->sin_port)
         {
             port = ((struct sockaddr_in *)addr)->sin_port;
-            DEBUG_MESSAGE("Override port to %d", __constant_htons(port));
+            DEBUG_MESSAGE("Override port to %d\n", __constant_htons(port));
         }
         udphdr = (struct udphdr *)(iphdr + 1);
     }
@@ -1046,7 +1063,7 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
         if (addr && ((struct sockaddr_in6 *)addr)->sin6_port)
         {
             port = ((struct sockaddr_in6 *)addr)->sin6_port;
-            DEBUG_MESSAGE("Override port to %d (ipv6)", __constant_htons(port));
+            DEBUG_MESSAGE("Override port to %d (ipv6)\n", __constant_htons(port));
         }
         udphdr = (struct udphdr *)(ipv6hdr + 1);
     }
