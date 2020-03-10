@@ -84,7 +84,8 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port);
  * @param[in] addrLen The address length (as for connect)
  * @param[in] addr_bind An optional parameter of the local address to use.  The
  *            length is assumed to be the same as the addrLen above.
- * @param[in] ifport Optional ethernet system port to use.
+ * @param[in] ifport Optional ethernet system port to use (required for
+ *            listening).
  * @returns A pointer to lsxdp_socket_reqs_t if successful or NULL if not.
  * This pointer MUST be freed with a free() call when done.
  * @warning This function waits for up to 5 seconds for a packet response to
@@ -162,8 +163,8 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
  * NAT devices.
  * @returns -1 for an error or 0 for success.
  **/
-int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
-                struct sockaddr *addr);
+//int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
+//                struct sockaddr *addr);
 
 /**
  * @fn xdp_send_completed

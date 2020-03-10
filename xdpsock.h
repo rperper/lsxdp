@@ -11,6 +11,7 @@
 #define XDPSOCK_ETH_LEN 6
 #define MAX_SOCKS       8
 
+#include <linux/in.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>

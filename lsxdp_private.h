@@ -21,6 +21,7 @@ extern "C" {
 #define MAX_SOCKS  8
 
 #define DEBUG_HEXDUMP 0
+#define MAC_LEN       6
 
 #include "xdpsock.h"
 
@@ -32,6 +33,12 @@ struct xsk_umem_info {
 	struct xsk_ring_cons cq;
 	struct xsk_umem *umem;
 	void *buffer;
+    int   m_tx_base;
+    int   m_tx_max;
+    int   m_tx_count;
+    int   m_pending_recv;
+    void *m_last_send_buffer;
+    int   m_recv_no_effect;
 };
 
 struct xsk_socket_info {
@@ -67,6 +74,7 @@ typedef  struct xdp_socket_s
     __u32                   m_last_tx_index_gotten;
     void                   *m_last_tx_buffer_gotten;
     int                     m_last_tx_frame_size;
+    int                     m_busy_send;
 } xdp_socket_t;
 
 typedef struct xdp_if_s
@@ -78,6 +86,9 @@ typedef struct xdp_if_s
     int                     m_progfd;
     int                     m_ping_attached;
     int                     m_socket_attached;
+    char                    m_mac[MAC_LEN];
+    struct sockaddr_in      m_sa_in;
+    struct sockaddr_in6     m_sa_in6;
 } xdp_if_t;
 
 typedef struct xdp_prog_s
@@ -91,21 +102,6 @@ typedef struct xdp_prog_s
     int                     m_max_frame_size;
 } xdp_prog_t;
 
-/**
- * @typedef xdp_recv_raw_details
- * @brief Used to properly return a received packet.  This is jammed into the
- * headroom of the packet (just after the ethernet header so that the ethernet
- * info is available for subsequent sends) so that it can be returned
- * successfully.
- **/
-struct xdp_recv_raw_details_s
-{
-    __u64 m_addr;           // buffer address
-    __u32 m_idx_fq;         // fq index
-    __u16 m_header_size;    // The size of the header
-} __attribute__((packed));
-typedef struct xdp_recv_raw_details_s xdp_recv_raw_details_t;
-#define XDP_RAW_DETAILS_POS sizeof(struct ethhdr)
 
 #include "bpf_xdp.h"
 

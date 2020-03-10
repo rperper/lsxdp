@@ -150,7 +150,7 @@ static __always_inline int copy_vlan(__u16 proto, void *dest_end,
                                      struct vlan_hdr *src)
 {
     char *cpdest = (char *)dest;
-    int i;
+    __u32 i;
 
     if (cpdest + sizeof(struct vlan_hdr) * VLAN_MAX_DEPTH >= (char *)dest_end)
     {
@@ -163,9 +163,11 @@ static __always_inline int copy_vlan(__u16 proto, void *dest_end,
 		if (!proto_is_vlan(proto))
 			break;
 
-		if (dest + 1 > dest_end)
-			break;
-
+		if (dest + 1 >= (struct vlan_hdr *)dest_end)
+        {
+            bpf_printk("copy_vlan, dest vlan too large, i:%d\n", i);
+            return -1;
+        }
         dest->h_vlan_TCI = src->h_vlan_TCI;
         dest->h_vlan_encapsulated_proto = src->h_vlan_encapsulated_proto;
 		proto = src->h_vlan_encapsulated_proto;
@@ -213,7 +215,7 @@ static __always_inline int copy_ipv4(void *dest_end,
                                      struct iphdr_simple *dest,
                                      struct iphdr_simple *src)
 {
-    if ((void *)dest + sizeof(struct iphdr_simple) * 2 >= dest_end)
+    if (dest + 1 >= (struct iphdr_simple *)dest_end)
     {
         bpf_printk("copy_ipv4, dest out of range\n");
         return -1;
@@ -288,6 +290,15 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
             bpf_printk("xdp_ping_func IPv6 NOT TCP: %d\n", ip_type);
 			goto out;
         }
+        else
+        {
+            bpf_printk("xdp_ping_func IPv6 addr %x:%x",
+                       ipv6hdr->saddr.in6_u.u6_addr32[0],
+                       ipv6hdr->saddr.in6_u.u6_addr32[1]);
+            bpf_printk(" :%x:%x\n",
+                       ipv6hdr->saddr.in6_u.u6_addr32[2],
+                       ipv6hdr->saddr.in6_u.u6_addr32[3]);
+        }
     }
     else
     {
@@ -360,32 +371,26 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     rec->m_header_size = (int)(header_end - data);
     map_end = (void *)(rec->m_header + sizeof(rec->m_header));
     bpf_printk("Copy the ethernet header, ip_index: %d\n", ip_index);
-    if (copy_ethhdr(/*data_end, */map_end, (struct ethhdr_simple *)rec->m_header,
-                     (struct ethhdr_simple *)eth) == -1)
+    if (copy_ethhdr(map_end, (struct ethhdr_simple *)rec->m_header,
+                    (struct ethhdr_simple *)eth) == -1)
         goto out;
+    bpf_printk("Is vlan: %d, proto: %d\n", proto_is_vlan(eth->h_proto), eth->h_proto);
     if (proto_is_vlan(eth->h_proto) &&
         copy_vlan(eth->h_proto, map_end,
                   (struct vlan_hdr *)(rec->m_header + sizeof(struct ethhdr_simple)),
                   (struct vlan_hdr *)(data + sizeof(struct ethhdr_simple))) == -1)
         goto out;
-    rec->m_ip_index = ip_index;
-    if (ip_index + sizeof(struct ipv6hdr) >= sizeof(rec->m_header))
-    {
-        bpf_printk("ip_index out of range: %d\n", ip_index);
-        goto out;
-    }
     if (!ipv4)
     {
         char *map_ipv6hdr;
-        rec->m_ip4 = 0;
-        map_ipv6hdr = rec->m_header + ip_index;
-        bpf_printk("Copy the IPv6 header\n");
-        if (map_ipv6hdr + sizeof(struct ipv6hdr) > (char *)map_end ||
-            map_ipv6hdr < rec->m_header)
+        // This test is done in both places to appease the interpreter
+        if (ip_index >= MAX_PACKET_HEADER_SIZE - sizeof(struct ipv6hdr) - sizeof(struct udphdr))
         {
-            bpf_printk("ipv6 header out of range\n");
+            bpf_printk("xdp_ping_func ip_index OUT OF RANGE (ipv6): %d\n", ip_index);
             goto out;
         }
+        map_ipv6hdr = rec->m_header + ip_index;
+        bpf_printk("Copy the IPv6 header\n");
         if (copy_ipv6(map_end,
                       (struct ipv6hdr_simple *)map_ipv6hdr,
                       (struct ipv6hdr_simple *)ipv6hdr) == -1)
@@ -394,20 +399,20 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     else
     {
         char *map_iphdr;
-        rec->m_ip4 = 1;
-        map_iphdr = rec->m_header + ip_index;
-        bpf_printk("Copy the IPv4 header\n");
-        if (map_iphdr + sizeof(struct iphdr_simple) > (char *)map_end ||
-            map_iphdr < rec->m_header)
+        // This test is done in both places to appease the interpreter
+        if (ip_index >= MAX_PACKET_HEADER_SIZE - sizeof(struct ipv6hdr) - sizeof(struct udphdr))
         {
-            bpf_printk("ipv4 header out of range\n");
+            bpf_printk("xdp_ping_func ip_index OUT OF RANGE (ipv4): %d\n", ip_index);
             goto out;
         }
+        map_iphdr = rec->m_header + ip_index;
+        bpf_printk("Copy the IPv4 header\n");
         if (copy_ipv4(map_end,
                       (struct iphdr_simple *)map_iphdr,
                       (struct iphdr_simple *)iphdr) == -1)
             goto out;
     }
+    rec->m_ip_index = ip_index;
     action = XDP_PASS;
     bpf_printk("xdp_ping_func SUCCESS!!!\n");
 out:

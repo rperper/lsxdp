@@ -5,11 +5,18 @@
 #include "ifaddrs.h"
 #include "libbpf/src/bpf.h"
 #include "poll.h"
+#include <stdio.h>
+#include <time.h>
+#include <linux/if_arp.h>
 #include <linux/if_ether.h>
 #include "linux/in.h"
 #include "linux/icmp.h"
+#include "linux/ioctl.h"
+#include "linux/sockios.h"
+#include "net/if.h"
+#include "sys/ioctl.h"
 
-static int s_xdp_debug = 1;
+static int s_xdp_debug = 0;
 #define DEBUG_ON    s_xdp_debug
 #define DEBUG_MESSAGE(...) if (s_xdp_debug) fprintf(stderr, __VA_ARGS__)
 
@@ -26,6 +33,7 @@ static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
                                   /* XDP_ZEROCOPY | // Force zero copy */
                                   0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
 static u32 s_pending_recv = XSK_RING_PROD__DEFAULT_NUM_DESCS / 2;
+static int tx_only(xdp_socket_t *sock, void *buffer, int len, int last);
 
 void xdp_debug(int on)
 {
@@ -92,6 +100,9 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                              &sock->m_sock_info->rx, &sock->m_sock_info->tx, &cfg);
 	if (ret)
     {
+        DEBUG_MESSAGE("xsk_socket__create error %s (%d) index: %d name: %s\n",
+                      strerror(-ret), -ret, ifindex,
+                      sock->m_xdp_prog->m_if[ifindex].m_ifname);
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "xsk_socket__create error %s index: %d name: %s", strerror(-ret),
                  ifindex, sock->m_xdp_prog->m_if[ifindex].m_ifname);
@@ -108,20 +119,118 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                  "bpf_get_link_xdp_id error %s", strerror(-ret));
 		return -1;
     }
-    DEBUG_MESSAGE("Put a lot packets into the fill queue so they can be used for recv\n");
 	ret = xsk_ring_prod__reserve(&sock->m_umem->fq,
                                  s_pending_recv, &idx);
+    DEBUG_MESSAGE("Put a lot packets into the fill queue so they can be used "
+                  "for recv, starting at index: %d\n", idx);
 	if (ret != s_pending_recv)
     {
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "xsk_ring_prod__reserve error %s", strerror(-ret));
 		return -1;
     }
+    sock->m_umem->m_pending_recv = s_pending_recv;
+    sock->m_umem->m_tx_base = s_pending_recv;
+    sock->m_umem->m_tx_max = s_pending_recv;
 	for (i = 0; i < s_pending_recv; i++)
 		*xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx++) =
 			i * sock->m_xdp_prog->m_max_frame_size;
-	xsk_ring_prod__submit(&sock->m_umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS);
+	xsk_ring_prod__submit(&sock->m_umem->fq, s_pending_recv);
 	return 0;
+}
+
+static int get_mac(xdp_prog_t *prog, const char *ifport, char mac[])
+{
+    int fd;
+    struct ifreq ifr;
+
+    memset(&ifr, 0, sizeof(ifr));
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1)
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Error getting mac: %s for %s - get socket\n",
+                      strerror(err), ifport);
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Error getting mac: %s for %s - can't get socket",
+                 strerror(err), ifport);
+        return -1;
+    }
+    ifr.ifr_addr.sa_family = AF_INET;
+    strncpy(ifr.ifr_name, ifport, sizeof(ifr.ifr_name));
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr))
+    {
+        int err = errno;
+        close(fd);
+        DEBUG_MESSAGE("Error getting mac: %s for %s - ioctl\n",
+                      strerror(err), ifport);
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Error getting mac: %s for %s - can't use ioctl",
+                 strerror(err), ifport);
+        return -1;
+    }
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, MAC_LEN);
+    close(fd);
+    DEBUG_MESSAGE("Mac addr: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                  (unsigned char)mac[0],
+                  (unsigned char)mac[1],
+                  (unsigned char)mac[2],
+                  (unsigned char)mac[3],
+                  (unsigned char)mac[4],
+                  (unsigned char)mac[5]);
+    return 0;
+}
+
+static int get_addrs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *prog)
+{
+    struct ifaddrs *ifap, *ifa;
+
+    if (getifaddrs(&ifap))
+    {
+        int err = errno;
+        DEBUG_MESSAGE("getifaddrs error: %s\n", strerror(err));
+        snprintf(prog_init_err, prog_init_err_len, "getifaddrs error: %s",
+                 strerror(err));
+        return -1;
+    }
+    ifa = ifap;
+    while (ifa)
+    {
+        int i;
+        for (i = 1; i < MAX_IF; ++i)
+        {
+            if (!(strcmp(prog->m_if[i].m_ifname, ifa->ifa_name)))
+            {
+                if (prog->m_if[i].m_disable)
+                {
+                    DEBUG_MESSAGE("Ignore addrs for disabled if: %s\n",
+                                  ifa->ifa_name);
+                    break;
+                }
+                if (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET)
+                {
+                    memcpy(&prog->m_if[i].m_sa_in, ifa->ifa_addr,
+                           sizeof(prog->m_if[i].m_sa_in));
+                    DEBUG_MESSAGE("%s is ipv4: %u.%u.%u.%u\n", ifa->ifa_name,
+                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[0],
+                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[1],
+                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[2],
+                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[3]);
+                    break;
+                }
+                else if (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET6)
+                {
+                    memcpy(&prog->m_if[i].m_sa_in6, ifa->ifa_addr,
+                           sizeof(prog->m_if[i].m_sa_in6));
+                    DEBUG_MESSAGE("%s is ipv6\n", ifa->ifa_name);
+                    break;
+                }
+            }
+        }
+        ifa = ifa->ifa_next;
+    }
+    freeifaddrs(ifap);
+    return 0;
 }
 
 static int get_ifs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *prog)
@@ -132,14 +241,17 @@ static int get_ifs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *prog)
     names = if_nameindex();
     if (!names)
     {
+        int err = errno;
+        DEBUG_MESSAGE("if_nameindex error: %s\n", strerror(err));
         snprintf(prog_init_err, prog_init_err_len, "if_nameindex error: %s",
-                 strerror(errno));
+                 strerror(err));
         return -1;
     }
     while (names[index].if_index)
     {
         if (names[index].if_index >= MAX_IF)
         {
+            DEBUG_MESSAGE("Too many interfaces!\n");
             snprintf(prog_init_err, prog_init_err_len,
                      "Too many interfaces for the program to process (max %d)",
                      MAX_IF - 1);
@@ -152,6 +264,9 @@ static int get_ifs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *prog)
             prog->m_max_if = names[index].if_index;
         if (!strcmp(prog->m_if[names[index].if_index].m_ifname, "lo"))
             prog->m_if[names[index].if_index].m_disable = 1;
+        else if (get_mac(prog, names[index].if_name,
+                         prog->m_if[names[index].if_index].m_mac))
+            prog->m_if[names[index].if_index].m_disable = 1;
         DEBUG_MESSAGE("Interface #%d, idx: %d, max: %d: %s %s\n", index,
                       names[index].if_index, prog->m_max_if,
                       prog->m_if[names[index].if_index].m_ifname,
@@ -159,6 +274,8 @@ static int get_ifs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *prog)
         ++index;
     }
     if_freenameindex(names);
+    if (ret == 0)
+        ret = get_addrs(prog_init_err, prog_init_err_len, prog);
     return ret;
 }
 
@@ -362,53 +479,45 @@ static int addr_bind_to_ifport(xdp_prog_t *prog,
                                const struct sockaddr *addr_bind,
                                char ifport[])
 {
-    struct ifaddrs *ifaddrs;
-    struct ifaddrs *ifa;
+    int i;
+    ifport[0] = 0;
     if (!addr_bind || !addr_bind->sa_family)
     {
         DEBUG_MESSAGE("addr_bind_to_ifport NO addr_bind specified\n");
-        ifport[0] = 0;
         return 0;
     }
-    if (getifaddrs(&ifaddrs))
+    for (i = 1; i <= prog->m_max_if; ++i)
     {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can't get addresses list, specify ifport name: %s",
-                 strerror(errno));
-        return -1;
-    }
-    ifa = ifaddrs;
-    while (ifa)
-    {
-        if (((struct sockaddr_in *)addr_bind)->sin_family == ((struct sockaddr_in *)ifa->ifa_addr)->sin_family &&
-            ((((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET &&
-              ((struct sockaddr_in *)addr_bind)->sin_addr.s_addr == ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr) ||
-             (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET6 &&
-              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[0] &&
-              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[1] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[1] &&
-              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[2] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[2] &&
-              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[3] == ((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr.in6_u.u6_addr32[3])))
+        if ((addr_bind->sa_family == AF_INET &&
+             prog->m_if[i].m_sa_in.sin_family == AF_INET &&
+             ((struct sockaddr_in *)addr_bind)->sin_addr.s_addr == prog->m_if[i].m_sa_in.sin_addr.s_addr) ||
+            (addr_bind->sa_family == AF_INET6 &&
+             prog->m_if[i].m_sa_in6.sin6_family == AF_INET6 &&
+             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[0] &&
+             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[1] &&
+             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[2] &&
+             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[3]))
         {
-            if (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET)
+            if (addr_bind->sa_family == AF_INET)
                 DEBUG_MESSAGE("Found addr_bind addr %u.%u.%u.%u on %s\n",
                               ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[0],
                               ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[1],
                               ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[2],
                               ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[3],
-                              ifa->ifa_name);
+                              prog->m_if[i].m_ifname);
             else
-                DEBUG_MESSAGE("Found addr_bind addr (v6) on %s\n", ifa->ifa_name);
-            strcpy(ifport, ifa->ifa_name);
+                DEBUG_MESSAGE("Found addr_bind addr (v6) on %s\n", prog->m_if[i].m_ifname);
+            strcpy(ifport, prog->m_if[i].m_ifname);
             break;
         }
-        else
-            ifa = ifa->ifa_next;
     }
-    if (!ifa)
+    if (!ifport[0])
+    {
+        DEBUG_MESSAGE("Bind address not found in list of interfaces\n");
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "Bind address not found in list of interfaces - respecify");
-    freeifaddrs(ifaddrs);
-    return ((ifa == NULL) ? -1 : 0);
+    }
+    return (ifport[0] ? 0 : -1);
 }
 
 static int ifport_to_addr_bind(xdp_prog_t *prog,
@@ -416,38 +525,42 @@ static int ifport_to_addr_bind(xdp_prog_t *prog,
                                int ipv4,
                                struct sockaddr *addr_bind)
 {
-    struct ifaddrs *ifaddrs;
-    struct ifaddrs *ifa;
-    if (getifaddrs(&ifaddrs))
+    int i;
+    DEBUG_MESSAGE("ifport_to_addr_bind, port: %s, %s\n", ifport,
+                  ipv4 ? "IPv4" : "IPv6");
+
+    for (i = 1; i <= prog->m_max_if; ++i)
     {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can't getifaddrs() for getting address of port: %s",
-                 strerror(errno));
-        return -1;
-    }
-    ifa = ifaddrs;
-    while (ifa)
-    {
-        if (!strcmp(ifport, ifa->ifa_name))
+        if (!(strcmp(ifport, prog->m_if[i].m_ifname)))
         {
-            if (ipv4 && ((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET)
+            if (ipv4 &&
+                prog->m_if[i].m_sa_in.sin_family == AF_INET)
             {
-                memcpy(addr_bind, ifa->ifa_addr, sizeof(struct sockaddr_in));
+                memcpy(addr_bind, &prog->m_if[i].m_sa_in,
+                       sizeof(struct sockaddr_in));
+                DEBUG_MESSAGE("Addr for port %s is %u.%u.%u.%u\n", ifport,
+                              ((unsigned char *)&prog->m_if[i].m_sa_in)[0],
+                              ((unsigned char *)&prog->m_if[i].m_sa_in)[1],
+                              ((unsigned char *)&prog->m_if[i].m_sa_in)[2],
+                              ((unsigned char *)&prog->m_if[i].m_sa_in)[3]);
                 break;
             }
-            else if (!ipv4 && ((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET6)
+            if (!ipv4 &&
+                prog->m_if[i].m_sa_in6.sin6_family == AF_INET6)
             {
-                memcpy(addr_bind, ifa->ifa_addr, sizeof(struct sockaddr_in6));
+                memcpy(addr_bind, &prog->m_if[i].m_sa_in6,
+                       sizeof(struct sockaddr_in6));
                 break;
             }
         }
-        ifa = ifa->ifa_next;
     }
-    if (!ifa)
+    if (i > prog->m_max_if)
+    {
+        DEBUG_MESSAGE("Can't find ifname: %s in ifs\n", ifport);
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "ifname not found in list of interfaces - respecify");
-    freeifaddrs(ifaddrs);
-    return ((ifa == NULL) ? -1 : 0);
+                 "ifname not found in list of interfaces - respecify");\
+    }
+    return ((i > prog->m_max_if) ? -1 : 0);
 }
 
 static int check_if(xdp_prog_t *prog, const char *ifport,
@@ -481,6 +594,7 @@ static int check_if(xdp_prog_t *prog, const char *ifport,
         {
             if (enabled_one)
             {
+                DEBUG_MESSAGE("Attempt to bind to more than one interface\n");
                 snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                          "Attempt to bind to more than one interface specify a "
                          "specific interface or bind-to address");
@@ -776,6 +890,7 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                  "Can not find map entry of successful connect");
         return NULL;
     }
+
     if (!(reqs = malloc_reqs(prog, found_index)))
         return NULL;
     reqs->m_sendable = 1;
@@ -798,7 +913,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
         return NULL;
 
     DEBUG_MESSAGE("xdp_get_socket_reqs - forcably detach any loaded XDP progs "
-                  "on if #%d!\n", enabled_if);
+                  "on if #%d: %s!\n", enabled_if, prog->m_if[enabled_if].m_ifname);
     if (xdp_link_detach(prog, enabled_if, opt_xdp_flags, 0))
         DEBUG_MESSAGE("xdp_link_detach failed: %s\n", prog->m_err);
 
@@ -865,7 +980,7 @@ void xdp_prog_done ( xdp_prog_t* prog, int unload, int force_unload )
     if (!prog)
         return;
     if (unload)
-        detach_ping(prog, force_unload);
+        detach_ping(prog, 1/*force_unload*/);
     if (prog->m_num_socks)
         fprintf(stderr, "%d Sockets remain open!\n", prog->m_num_socks);
     if (prog->m_bufs)
@@ -888,41 +1003,86 @@ static int kick_tx(xdp_socket_t *sock)
 {
 	int ret;
 
+    if (sock->m_busy_send)
+        DEBUG_MESSAGE("busy_send retry\n");
+
 	ret = sendto(xsk_socket__fd(sock->m_sock_info->xsk), NULL, 0, MSG_DONTWAIT,
                  NULL, 0);
+    int orig_errno = errno;
 	if (ret >= 0 || errno == ENOBUFS || errno == EAGAIN || errno == EBUSY)
     {
-        DEBUG_MESSAGE("sendto returned %d, errno: %d\n", ret, errno);
+        if (ret != 0)
+        {
+            DEBUG_MESSAGE("sendto returned %d, errno: %d: %s - setting busy_send\n",
+                          ret, orig_errno, strerror(orig_errno));
+            errno = orig_errno;
+            sock->m_busy_send = 1;
+            return -1;
+        }
+        if (sock->m_busy_send)
+            DEBUG_MESSAGE("Clearing busy_send\n");
+        sock->m_busy_send = 0;
 		return 0;
     }
+    if (sock->m_busy_send)
+        DEBUG_MESSAGE("Clearing busy_send\n");
+    DEBUG_MESSAGE("Error in send: %s\n", strerror(orig_errno));
     snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-             "Error in send: %s", strerror(errno));
+             "Error in send: %s", strerror(orig_errno));
+    sock->m_busy_send = 0;
+    errno = orig_errno;
     return -1;
 }
 
-static inline int complete_tx_only(xdp_socket_t *sock)
+static inline int complete_tx_only(xdp_socket_t *sock, int *released)
 {
 	unsigned int rcvd;
 	u32 idx;
+    int was_busy_send = sock->m_busy_send;
 
-	if (!sock->m_sock_info->outstanding_tx)
-    {
-        DEBUG_MESSAGE("complete_tx_only - leave early no packets to send\n");
-		return 0;
-    }
+    *released = 0;
+    //DEBUG_MESSAGE("TX: kick_tx\n");
+    //if (!sock->m_sock_info->outstanding_tx)
+    //    return 0;
     if (kick_tx(sock))
         return -1;
-
-    rcvd = xsk_ring_cons__peek(&sock->m_umem->cq, 1, &idx);
+    if (was_busy_send)
+        return 0;
+    rcvd = xsk_ring_cons__peek(&sock->m_umem->cq, 64, &idx);
     if (rcvd > 0)
     {
+        int i;
+        *released = 1;
+        for (i = 0; i < rcvd; ++i)
+            DEBUG_MESSAGE("TX: release: %d\n", idx + i);
+
         xsk_ring_cons__release(&sock->m_umem->cq, rcvd);
-        DEBUG_MESSAGE("Completion queue has %d, idx: %d\n", rcvd, idx);
-        sock->m_sock_info->outstanding_tx -= rcvd;
+        if (sock->m_sock_info->outstanding_tx)
+        {
+            if (sock->m_sock_info->outstanding_tx >= rcvd)
+                sock->m_sock_info->outstanding_tx -= rcvd;
+            else
+            {
+                sock->m_sock_info->outstanding_tx = 0;
+                DEBUG_MESSAGE("TX: Completion queue forced to zero (would go lower)\n");
+            }
+        }
+        if (sock->m_umem->m_tx_count >= rcvd)
+        {
+            sock->m_umem->m_tx_count -= rcvd;
+            DEBUG_MESSAGE("TX: New tx_count: %d\n", sock->m_umem->m_tx_count);
+        }
+        else
+        {
+            DEBUG_MESSAGE("TX: tx_count now forced to 0\n");
+            sock->m_umem->m_tx_count = 0;
+        }
+        DEBUG_MESSAGE("TX: Completion queue has %d, idx: %d, outstanding: %d\n",
+                      rcvd, idx, sock->m_sock_info->outstanding_tx);
         sock->m_sock_info->tx_npkts += rcvd;
     }
-    else
-        DEBUG_MESSAGE("Completion queue Empty\n");
+    //else
+    //    DEBUG_MESSAGE("TX: Completion queue Empty\n");
 
 	return 0;
 }
@@ -932,6 +1092,10 @@ static int tx_only(xdp_socket_t *sock, void *buffer, int len, int last)
     struct xdp_desc *desc;
     u32 idx;
     int ret;
+    int released;
+    if (sock->m_busy_send)
+        return complete_tx_only(sock, &released);
+    DEBUG_MESSAGE("TX: tx_only\n");
     ret = xsk_ring_prod__reserve(&sock->m_sock_info->tx, 1, &idx);
     if (ret != 1)
     {
@@ -940,14 +1104,14 @@ static int tx_only(xdp_socket_t *sock, void *buffer, int len, int last)
         return -1;
     }
     desc = xsk_ring_prod__tx_desc(&sock->m_sock_info->tx, idx);
-    DEBUG_MESSAGE("tx_only:\n");
+    DEBUG_MESSAGE("TX: sent:\n");
     traceBuffer(buffer, len);
     desc->addr = get_index_from_buffer(sock, buffer) * sock->m_xdp_prog->m_max_frame_size;
     desc->len = len;
 
 	xsk_ring_prod__submit(&sock->m_sock_info->tx, 1);
     sock->m_sock_info->outstanding_tx += 1;
-    if (last && complete_tx_only(sock))
+    if (last && complete_tx_only(sock, &released))
         return -1;
     return 0;
 }
@@ -956,65 +1120,84 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
 {
     /* The key is the number of outstanding_tx packets.  If it's >=
      * NUM_FRAMES, we need to kick the sender to get them out. */
-    int prod_reserve;
-    u32 index;
+    int index = -1;
     void *buffer;
-    if (sock->m_sock_info->outstanding_tx >= NUM_FRAMES * sock->m_xdp_prog->m_max_frame_size &&
-        complete_tx_only(sock))
-        return NULL; // Error already in buffer
-    if (sock->m_sock_info->outstanding_tx >= NUM_FRAMES * sock->m_xdp_prog->m_max_frame_size)
+
     {
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "All packets still outstanding.  Do a poll first");
-        return NULL;
+        int rc;
+        struct pollfd p;
+        memset(&p, 0, sizeof(p));
+        p.fd = xdp_get_poll_fd(sock);
+        p.events = POLLIN;
+        rc = poll(&p, 1, 0);
+        DEBUG_MESSAGE("xdp_get_send_buffer, pending recv: %s\n",
+                      (rc == 1) ? "YES" : ((rc == 0) ? "NO" : strerror(errno)));
+        if (rc == 1 && p.revents != POLLIN)
+            DEBUG_MESSAGE("UNEXPECTED RECEIVED EVENT: %d\n", p.revents);
     }
-	prod_reserve = xsk_ring_prod__reserve(&sock->m_umem->fq, 1, &index);
-    DEBUG_MESSAGE("last_tx_index_gotten: %d, prod_reserve: %d\n",
-                  index, prod_reserve);
-    if (prod_reserve == 1)
-        buffer = xsk_umem__get_data(sock->m_umem->buffer,
-                                    index * sock->m_xdp_prog->m_max_frame_size);
+    if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
+        index = sock->m_umem->m_tx_count;
     else
     {
+        int released;
+        struct timespec ts_entry, ts_exit;
+        long interval;
+        DEBUG_MESSAGE("Enter hard loop waiting for packets to be available\n");
+        clock_gettime(CLOCK_REALTIME, &ts_entry);
+        do {
+            int rc;
+            struct pollfd p;
+            memset(&p, 0, sizeof(p));
+            p.fd = xdp_get_poll_fd(sock);
+            p.events = POLLOUT;
+            rc = poll(&p, 1, 100); // 100ms
+            if (rc == 0)
+            {
+                DEBUG_MESSAGE("TX: Poll had no success\n");
+                snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                         "poll had no success getting sending buffer");
+                return NULL;
+            }
+            else if (rc == -1)
+            {
+                snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                         "poll for send failed: %s", strerror(errno));
+                DEBUG_MESSAGE("TX: %s\n", sock->m_xdp_prog->m_err);
+                return NULL;
+            }
+            if (complete_tx_only(sock, &released))
+                return NULL; // Error in buffer
+            if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
+                index = sock->m_umem->m_tx_count;
+            else
+            {
+                clock_gettime(CLOCK_REALTIME, &ts_exit);
+                interval = (ts_exit.tv_sec * 1000000000 + ts_exit.tv_nsec) -
+                           (ts_entry.tv_sec * 1000000000 + ts_entry.tv_nsec);
+            }
+        } while (index == -1 && interval < 1000000000);
+        if (index == -1)
+        {
+            DEBUG_MESSAGE("TX: TIMED OUT waiting for packet to be available\n");
+            return NULL;
+        }
+        DEBUG_MESSAGE("TX: Delay of %ld ns\n", interval);
+    }
+    if (index == -1)
+    {
+        DEBUG_MESSAGE("TX: Unable to reserve a packet for a full frame\n");
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "Unable to reserve a packet for a full frame size.  Poll?");
         return NULL;
     }
-    DEBUG_MESSAGE("Using header: (header size: %d)\n", sock->m_reqs->m_rec.m_header_size);
-    traceBuffer(sock->m_reqs->m_rec.m_header, xdp_send_udp_headroom(sock));
+    sock->m_umem->m_tx_count++;
+    buffer = xsk_umem__get_data(sock->m_umem->buffer,
+                                (index + sock->m_umem->m_tx_base) * sock->m_xdp_prog->m_max_frame_size);
+    sock->m_umem->m_last_send_buffer = buffer;
+    DEBUG_MESSAGE("TX: Using header: tx_count: %d (header size: %d), last_send_buffer Addr: %p\n",
+                  index, sock->m_reqs->m_rec.m_header_size, buffer);
     memcpy(buffer, sock->m_reqs->m_rec.m_header, xdp_send_udp_headroom(sock));
     return (void *)((char *)buffer + xdp_send_udp_headroom(sock));
-}
-
-int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
-             struct sockaddr *addr)
-{
-    int headroom = xdp_send_udp_headroom(sock);
-    char *send_buffer;
-    char *data_char = data;
-
-    if (!sock->m_reqs->m_sendable)
-    {
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "This socket can not yet be used for sending (must be setup"
-                 " as documented");
-        return -1;
-    }
-    if (data_char > (char *)sock->m_umem->buffer &&
-        data_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES)
-    {
-        DEBUG_MESSAGE("Data in buffer range - assume it was gotten correctly\n");
-        send_buffer = data_char - headroom;
-    }
-    else
-    {
-        DEBUG_MESSAGE("xdp_send, NOT zero copy, copy in the data\n");
-        send_buffer = xdp_get_send_buffer(sock);
-        if (!send_buffer)
-            return -1;
-        memcpy(send_buffer + headroom, data, len);
-    }
-    return xdp_send_zc(sock, send_buffer, len, last, addr);
 }
 
 int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
@@ -1025,22 +1208,28 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
     char *buffer_char = buffer;
     __u16 port = sock->m_reqs->m_port;
     int headroom = xdp_send_udp_headroom(sock);
-    if (buffer_char >= (char *)sock->m_umem->buffer &&
-        buffer_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES &&
-        (unsigned long)buffer_char % sock->m_xdp_prog->m_max_frame_size == 0)
-        DEBUG_MESSAGE("Buffer in range - assume it was gotten correctly\n");
+    if ((buffer_char >= (char *)sock->m_umem->buffer) &&
+        (buffer_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES))
+    {
+        DEBUG_MESSAGE("TX: Buffer in range - assume it was gotten correctly\n");
+    }
     else
     {
+        DEBUG_MESSAGE("TX: Require that the packet be aquired with get_send_buffer\n");
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "Require that the packet be acquired with a xdp_get_send_buffer()"
-                 " or a call to xdp_send()");
+                 " or a call to xdp_send() - %p not in range %p..%p (test 1: %d, test 2: %d)",
+                 buffer_char, sock->m_umem->buffer,
+                 sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES,
+                 buffer_char >= (char *)sock->m_umem->buffer,
+                 buffer_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES);
         return -1;
     }
     ip_index = sock->m_reqs->m_rec.m_ip_index;
     if (sock->m_reqs->m_rec.m_ip4)
     {
         struct iphdr *iphdr = (struct iphdr *)&buffer_char[ip_index];
-        DEBUG_MESSAGE("ip_index begins at %d\n", ip_index);
+        DEBUG_MESSAGE("TX: ip_index begins at %d\n", ip_index);
         iphdr->ihl = 5;
         iphdr->tot_len = __constant_htons(20 + sizeof(struct udphdr) + len);
         iphdr->ttl = 20;
@@ -1050,7 +1239,7 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
         if (addr && ((struct sockaddr_in *)addr)->sin_port)
         {
             port = ((struct sockaddr_in *)addr)->sin_port;
-            DEBUG_MESSAGE("Override port to %d\n", __constant_htons(port));
+            DEBUG_MESSAGE("TX: Override port to %d\n", __constant_htons(port));
         }
         udphdr = (struct udphdr *)(iphdr + 1);
     }
@@ -1063,7 +1252,7 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
         if (addr && ((struct sockaddr_in6 *)addr)->sin6_port)
         {
             port = ((struct sockaddr_in6 *)addr)->sin6_port;
-            DEBUG_MESSAGE("Override port to %d (ipv6)\n", __constant_htons(port));
+            DEBUG_MESSAGE("TX: Override port to %d (ipv6)\n", __constant_htons(port));
         }
         udphdr = (struct udphdr *)(ipv6hdr + 1);
     }
@@ -1076,9 +1265,141 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
     return tx_only(sock, buffer, len + headroom, last);
 }
 
+int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
+             struct sockaddr *addr)
+{
+    int headroom = xdp_send_udp_headroom(sock);
+    char *send_buffer;
+    char *data_char = data;
+    int released;
+
+    if (sock->m_busy_send)
+    {
+        int rc;
+        send_buffer = data - headroom;
+        if (!sock->m_umem->m_last_send_buffer)
+        {
+            DEBUG_MESSAGE("TX: in busy send in xdp_send, just retry for now\n");
+            return complete_tx_only(sock, &released);
+        }
+        DEBUG_MESSAGE("TX: in busy send in xdp_send, but a pending buffer %p"
+                      ", current buffer: %p\n", sock->m_umem->m_last_send_buffer,
+                      send_buffer);
+        rc = complete_tx_only(sock, &released);
+        if (rc)
+            return rc;
+        if (send_buffer == sock->m_umem->m_last_send_buffer)
+        {
+            DEBUG_MESSAGE("TX: busy send but NEW DATA to send!\n");
+        }
+        else
+        {
+            DEBUG_MESSAGE("TX: busy send but probably no new data to send\n");
+            return 0;
+        }
+    }
+    sock->m_umem->m_last_send_buffer = NULL;
+    if (!sock->m_reqs->m_sendable)
+    {
+        DEBUG_MESSAGE("TX: socket can't be used for sending\n");
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "This socket can not yet be used for sending (must be setup"
+                 " as documented");
+        return -1;
+    }
+    if (data_char > (char *)sock->m_umem->buffer &&
+        data_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES)
+    {
+        DEBUG_MESSAGE("TX: Data in buffer range - assume it was gotten correctly\n");
+        send_buffer = data_char - headroom;
+    }
+    else
+    {
+        DEBUG_MESSAGE("TX: xdp_send, NOT zero copy, copy in the data\n");
+        send_buffer = xdp_get_send_buffer(sock);
+        if (!send_buffer)
+            return -1;
+        memcpy(send_buffer + headroom, data, len);
+    }
+    return xdp_send_zc(sock, send_buffer, len, last, addr);
+}
+
 int xdp_send_udp_headroom(xdp_socket_t *sock)
 {
     return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
+}
+
+struct arp_eth
+{
+	__be16		ar_hrd;		/* format of hardware address	*/
+	__be16		ar_pro;		/* format of protocol address	*/
+	unsigned char	ar_hln;		/* length of hardware address	*/
+	unsigned char	ar_pln;		/* length of protocol address	*/
+	__be16		ar_op;		/* ARP opcode (command)		*/
+
+	 /*
+	  *	 Ethernet looks like this : This bit is variable sized however...
+	  */
+	unsigned char		ar_sha[ETH_ALEN];	/* sender hardware address	*/
+	unsigned char		ar_sip[4];		/* sender IP address		*/
+	unsigned char		ar_tha[ETH_ALEN];	/* target hardware address	*/
+	unsigned char		ar_tip[4];		/* target IP address		*/
+} __attribute__((packed));
+
+int process_arp(xdp_socket_t *sock, char *pkt, int len)
+{
+    struct ethhdr *eth = (struct ethhdr *)pkt;
+    struct arp_eth *arpe = (struct arp_eth *)&pkt[sizeof(struct ethhdr)];
+    void *data;
+    void *pkt_out;
+    struct ethhdr *eth_out;
+    struct arp_eth *arpe_out;
+    int i;
+
+    DEBUG_MESSAGE("ARP\n");
+    if (len < sizeof(*eth) + sizeof(*arpe))
+    {
+        DEBUG_MESSAGE("Message too small for ARP, ignore\n");
+        return 0;
+    }
+    if (memcmp(eth->h_dest, "\xff\xff\xff\xff\xff\xff", 6))
+    {
+        DEBUG_MESSAGE("ARP not broadcast, ignore\n");
+        return 0;
+    }
+    for (i = 1; i <= sock->m_xdp_prog->m_max_if; ++i)
+    {
+        if (!sock->m_xdp_prog->m_if[i].m_disable &&
+            sock->m_xdp_prog->m_if[i].m_sa_in.sin_family == AF_INET &&
+            sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr == *(__u32 *)arpe->ar_tip)
+            break;
+    }
+    if (i > sock->m_xdp_prog->m_max_if)
+    {
+        DEBUG_MESSAGE("Target IP not found\n");
+        return 0;
+    }
+    data = xdp_get_send_buffer(sock);
+    if (!data)
+        return -1;
+    pkt_out = (char *)data - xdp_send_udp_headroom(sock);
+    eth_out = (struct ethhdr *)pkt_out;
+    arpe_out = (struct arp_eth *)(eth_out + 1);
+    memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
+    memcpy(eth_out->h_source,
+           sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
+           sizeof(eth_out->h_source));
+    eth_out->h_proto = eth->h_proto;
+    arpe_out->ar_hrd = arpe->ar_hrd;
+    arpe_out->ar_pro = arpe->ar_pro;
+    arpe_out->ar_hln = arpe->ar_hln;
+    arpe_out->ar_pln = arpe->ar_pln;
+    arpe_out->ar_op = __constant_htons(2); // reply
+    memcpy(arpe_out->ar_sha, sock->m_xdp_prog->m_if[i].m_mac, sizeof(arpe_out->ar_sha));
+    memcpy(arpe_out->ar_sip, arpe->ar_tip, sizeof(arpe_out->ar_sip));
+    memcpy(arpe_out->ar_tha, arpe->ar_sha, sizeof(arpe_out->ar_tha));
+    memcpy(arpe_out->ar_tip, arpe->ar_sip, sizeof(arpe_out->ar_tip));
+    return tx_only(sock, pkt_out, sizeof(*eth_out) + sizeof(*arpe_out), 1);
 }
 
 int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
@@ -1104,7 +1425,7 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
         }
         if (iph->protocol != IPPROTO_UDP)
         {
-            DEBUG_MESSAGE("Recv not UDP\n");
+            DEBUG_MESSAGE("Recv not UDP (protocol: %d)\n",iph->protocol);
             return 1;
         }
         if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in))
@@ -1139,9 +1460,14 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
                    sizeof(struct in6_addr));
         }
     }
+    else if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_ARP))
+    {
+        process_arp(sock, pkt, len);
+        return 1; // NEVER return anything but 1 - not processing it.
+    }
     else
     {
-        DEBUG_MESSAGE("Recv not IPv4 or IPv6\n");
+        DEBUG_MESSAGE("Recv not IPv4 or IPv6 or ARP\n");
         return 1;
     }
     return 0;
@@ -1170,7 +1496,7 @@ int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len, int *header_pos,
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "Received packet: %d smaller than UDP length allows: %d",
                  *len, (*header_pos) + __constant_htons(udp->len));
-        return -1;
+        return 1;
     }
     if (addr)
     {
@@ -1179,18 +1505,34 @@ int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len, int *header_pos,
         else
             ((struct sockaddr_in6 *)addr)->sin6_port = udp->source;
     }
-    DEBUG_MESSAGE("Recv source port %d)\n",  __constant_htons(udp->source));
+    DEBUG_MESSAGE("Recv source port %d\n",  __constant_htons(udp->source));
     *len = (*header_pos) + __constant_htons(udp->len);
     *header_pos += sizeof(struct udphdr);
     return 0;
 }
 
-static void recv_return_raw(xdp_socket_t *sock, u32 idx_fq, u64 addr)
+static int recv_return_raw(xdp_socket_t *sock, void *buffer)
 {
-    *xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx_fq++) = addr;
-	xsk_ring_prod__submit(&sock->m_sock_info->umem->fq, 1);
-	xsk_ring_cons__release(&sock->m_sock_info->rx, 1);
+    int ret;
+    __u32 idx, idx_fq = 0;
+
+    idx = get_index_from_buffer(sock, buffer);
+    DEBUG_MESSAGE("recv_return_raw: Buffer: %p, idx: %d, pending_recv: %d\n",
+                  buffer, idx, sock->m_umem->m_pending_recv);
+	ret = xsk_ring_prod__reserve(&sock->m_umem->fq, 1, &idx_fq);
+    DEBUG_MESSAGE("Return into idx_fq: %d\n", idx_fq);
+	if (ret != 1)
+    {
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "recv_return_raw error returning %p (%d)", buffer, ret);
+		return -1;
+    }
+    sock->m_umem->m_pending_recv++;
+    *xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx_fq) =
+			idx * sock->m_xdp_prog->m_max_frame_size;
+	xsk_ring_prod__submit(&sock->m_umem->fq, 1);
 	sock->m_sock_info->rx_npkts += 1;
+    return 0;
 }
 
 
@@ -1252,79 +1594,61 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
              socklen_t *addrlen)
 {
 	unsigned int rcvd;
-	u32 idx_rx = 0, idx_fq = 0;
+	u32 idx_rx = 0;
 	int ret;
+    int was_recv = 0;
 
     *data = NULL;
     *sz = 0;
 	while ((rcvd = xsk_ring_cons__peek(&sock->m_sock_info->rx, 1, &idx_rx)))
     {
-
-        /*
-        ret = xsk_ring_prod__reserve(&sock->m_sock_info->umem->fq, rcvd, &idx_fq);
-        while (ret != rcvd) {
-            if (ret < 0)
-            {
-                snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                         "xsk_ring_prod__reserve failed on receive: %s",
-                         strerror(-ret));
-                return -1;
-            }
-            DEBUG_MESSAGE("Looping on receive finished queue?\n");
-            ret = xsk_ring_prod__reserve(&sock->m_sock_info->umem->fq, rcvd, &idx_fq);
-        }
-        */
         u64 addr = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx)->addr;
         u32 len = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx)->len;
         char *pkt = xsk_umem__get_data(sock->m_sock_info->umem->buffer, addr);
+        xsk_ring_cons__release(&sock->m_sock_info->rx, rcvd);
         int res;
         int header_pos = 0;
-        xdp_recv_raw_details_t *details;
 
-        DEBUG_MESSAGE("Recv raw packet:\n");
+        was_recv = 1;
+        sock->m_umem->m_pending_recv--;
+        DEBUG_MESSAGE("Recv raw packet: Addr: %p, pending_recv: %d, idx_rx: %d no_effect: %d\n",
+                      pkt, sock->m_umem->m_pending_recv, idx_rx, sock->m_umem->m_recv_no_effect);
+        sock->m_umem->m_recv_no_effect = 0;
         traceBuffer(pkt, len);
         res = parse_recv_ip_hdr(sock, pkt, len, &header_pos, sockaddr, addrlen);
-        if (res == -1)
-            return -1;
-        else if (res == 1)
+        if (res)
         {
-            recv_return_raw(sock, idx_fq, addr);
+            recv_return_raw(sock, pkt);
             continue;
         }
         res = parse_recv_udp_hdr(sock, pkt, &len, &header_pos, sockaddr);
-        if (res == -1)
-            return -1;
-        else if (res == 1)
+        if (res)
         {
-            recv_return_raw(sock, idx_fq, addr);
+            recv_return_raw(sock, pkt);
             continue;
         }
         if (!sock->m_reqs->m_sendable)
             rebuild_header(sock, pkt, sockaddr);
 
-        details = (xdp_recv_raw_details_t *)(pkt + XDP_RAW_DETAILS_POS);
-        details->m_idx_fq = idx_fq;
-        details->m_addr = addr;
-        details->m_header_size = header_pos;
         *data = (pkt + header_pos);
         *sz = len - header_pos;
-        DEBUG_MESSAGE("recv, data: %p, buffer: %p, details: %p\n", data, pkt,
-                      details);
-        traceBuffer(*data, *sz);
+        DEBUG_MESSAGE("recv, data: %p, buffer: %p\n", data, pkt);
+        //traceBuffer(*data, *sz);
 
-        return 0;
+        return 1; // Something received.
     }
-    DEBUG_MESSAGE("No UDP data\n");
+    if (!was_recv)
+        sock->m_umem->m_recv_no_effect++;
     return 0;
 }
 
 int xdp_recv_return(xdp_socket_t *sock, void *data)
 {
-    xdp_recv_raw_details_t *details;
     void *buffer;
 	if (data < sock->m_umem->buffer ||
-        data > sock->m_umem->buffer + (NUM_FRAMES + 1) * sock->m_xdp_prog->m_max_frame_size)
+        data >= sock->m_umem->buffer + sock->m_umem->m_tx_base * sock->m_xdp_prog->m_max_frame_size)
     {
+        DEBUG_MESSAGE("xdp_recv_return invalid buffer\n");
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "xdp_recv_return invalid buffer (data: %p, buffer: %p)",
                  data, sock->m_umem->buffer);
@@ -1332,29 +1656,25 @@ int xdp_recv_return(xdp_socket_t *sock, void *data)
     }
     buffer = (void *)(((__u64)data / sock->m_xdp_prog->m_max_frame_size) *
                       sock->m_xdp_prog->m_max_frame_size);
-    details = (xdp_recv_raw_details_t *)((char *)buffer + XDP_RAW_DETAILS_POS);
-    DEBUG_MESSAGE("recv_return, data: %p, buffer: %p, details: %p\n", data,
-                  buffer, details);
-    if (buffer + details->m_header_size != data)
-    {
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "xdp_recv_return buffer not expected: %p != %p", buffer, data);
-        return -1;
-    }
-    recv_return_raw(sock, details->m_idx_fq, details->m_addr);
+    DEBUG_MESSAGE("recv_return, data: %p, Addr: %p\n", data, buffer);
+    recv_return_raw(sock, buffer);
     return 0;
 }
 
 int xdp_send_completed(xdp_socket_t *sock, int *still_pending)
 {
     int ret;
+    int released;
     *still_pending = 0;
 	if (sock->m_sock_info->outstanding_tx)
     {
-        ret = complete_tx_only(sock);
+        ret = complete_tx_only(sock, &released);
         if (ret)
             return ret;
-        *still_pending = sock->m_sock_info->outstanding_tx;
+        if (released && !sock->m_sock_info->outstanding_tx)
+            *still_pending = 1;
+        else
+            *still_pending = sock->m_sock_info->outstanding_tx;
     }
     return 0;
 }
