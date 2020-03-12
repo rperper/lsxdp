@@ -238,7 +238,7 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
 	struct ethhdr *eth;
     struct ipv6hdr *ipv6hdr = NULL;
     struct iphdr *iphdr = NULL;
-    struct tcphdr  *tcphdr;
+    //struct tcphdr  *tcphdr;
     __u16 ip_index;
     void *map_end;
     int ipv4 = 0;
@@ -251,7 +251,7 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
         /* These keep track of the next header type and iterator pointer */
 	struct hdr_cursor nh;
     int ip_type;
-    int icmp_type;
+    //int icmp_type;
     void *header_end;
 
 	/* Start next header cursor position at data start */
@@ -267,9 +267,9 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     {
         ipv4 = 1;
    		ip_type = parse_iphdr(&nh, data_end, &iphdr);
-		if (ip_type != IPPROTO_TCP)
+		if (ip_type != IPPROTO_TCP && ip_type != IPPROTO_ICMP)
         {
-            bpf_printk("xdp_ping_func IP NOT TCP: %d\n", ip_type);
+            bpf_printk("xdp_ping_func IP NOT TCP or ICMP: %d\n", ip_type);
 			goto out;
         }
         else
@@ -285,9 +285,9 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     else if (h_proto == bpf_htons(ETH_P_IPV6))
     {
   		ip_type = parse_ip6hdr(&nh, data_end, &ipv6hdr);
-		if (ip_type != IPPROTO_TCP)
+		if (ip_type != IPPROTO_TCP && ip_type != IPPROTO_ICMP)
         {
-            bpf_printk("xdp_ping_func IPv6 NOT TCP: %d\n", ip_type);
+            bpf_printk("xdp_ping_func IPv6 NOT TCP or ICMP: %d\n", ip_type);
 			goto out;
         }
         else
@@ -306,12 +306,12 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
         goto out;
     }
     header_end = nh.pos;
-  	icmp_type = parse_tcphdr(&nh, data_end, &tcphdr);
-    if (icmp_type == -1)
-    {
-        bpf_printk("parse_tcphdr failed\n");
-        goto out;
-    }
+  	//icmp_type = parse_tcphdr(&nh, data_end, &tcphdr);
+    //if (icmp_type == -1)
+    //{
+    //    bpf_printk("parse_tcphdr failed\n");
+    //    goto out;
+    //}
     // Copy what we need and fix what we can
 	rec = bpf_map_lookup_elem(&packet_rec_def, &key);
 	/* BPF kernel-side verifier will reject program if the NULL pointer
@@ -363,11 +363,11 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
             goto out;
         }
     }
-    if (tcphdr->source != rec->m_port)
-    {
-        bpf_printk("xdp_ping_func wrong port %d\n", tcphdr->source);
-        goto out;
-    }
+    //if (tcphdr->source != rec->m_port)
+    //{
+    //    bpf_printk("xdp_ping_func wrong port %d\n", tcphdr->source);
+    //    goto out;
+    //}
     rec->m_header_size = (int)(header_end - data);
     map_end = (void *)(rec->m_header + sizeof(rec->m_header));
     bpf_printk("Copy the ethernet header, ip_index: %d\n", ip_index);

@@ -13,6 +13,7 @@
 #include "linux/icmp.h"
 #include "linux/ioctl.h"
 #include "linux/sockios.h"
+#include "linux/tcp.h"
 #include "net/if.h"
 #include "sys/ioctl.h"
 
@@ -33,7 +34,6 @@ static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
                                   /* XDP_ZEROCOPY | // Force zero copy */
                                   0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
 static u32 s_pending_recv = XSK_RING_PROD__DEFAULT_NUM_DESCS / 2;
-static int tx_only(xdp_socket_t *sock, void *buffer, int len, int last);
 
 void xdp_debug(int on)
 {
@@ -714,6 +714,7 @@ static unsigned short checksum(void *b, int len)
     return result;
 }
 
+/*
 static int send_connect(xdp_prog_t *prog, const struct sockaddr *addr,
                         socklen_t addrLen, const struct sockaddr *addr_bind)
 {
@@ -742,6 +743,103 @@ static int send_connect(xdp_prog_t *prog, const struct sockaddr *addr,
         DEBUG_MESSAGE("connect worked\n");
     close(sockfd);
     return 0;
+}
+*/
+
+#define PING_PKT_S 64
+struct ping_pkt
+{
+    struct icmphdr hdr;
+    char msg[PING_PKT_S-sizeof(struct icmphdr)];
+};
+
+static int send_ping(xdp_prog_t *prog, const struct sockaddr *addr,
+                     socklen_t addrLen, const struct sockaddr *addr_bind)
+{
+    int sockfd;
+    int ttl_val = 64;
+    int i;
+    int poll_rc = 0;
+    int count = 0;
+    struct ping_pkt pkt;
+
+    // TODO: send_ping for ipv6
+    sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sockfd < 0)
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Error creating ping socket: %s\n", strerror(err));
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Error creating ping socket to get socket requirements: %s",
+                 strerror(err));
+        return -1;
+    }
+    if (setsockopt(sockfd, 0/*SOL_IP or 41 for v6*/, IP_TTL, &ttl_val,
+                   sizeof(ttl_val)) != 0)
+        DEBUG_MESSAGE("Error setting ttl time: %s\n", strerror(errno));
+
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.hdr.type = ICMP_ECHO;
+    pkt.hdr.un.echo.id = getpid();
+    for (i = 0; i < sizeof(pkt.msg) - 1; ++i)
+        pkt.msg[i] = i + '0';
+    pkt.msg[i] = 0;
+    while (poll_rc == 0 && count < 20)
+    {
+        struct pollfd pol;
+
+        pkt.hdr.un.echo.sequence = ++count;
+        pkt.hdr.checksum = 0;
+        pkt.hdr.checksum = checksum(&pkt, sizeof(pkt));
+
+        DEBUG_MESSAGE("Doing sendto\n");
+        poll_rc = sendto(sockfd, &pkt, sizeof(pkt), 0, addr, addrLen);
+        if (poll_rc <= 0)
+        {
+            int err = errno;
+            poll_rc = -1;
+            DEBUG_MESSAGE("sendto failed: %s\n", strerror(err));
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "Error sending ping to get socket requirements: %s",
+                     strerror(err));
+            break;
+        }
+        DEBUG_MESSAGE("sendto worked\n");
+
+        // Could try a recvfrom, but that complicates the code - we just need
+        // to know that there's something to receive
+        memset(&pol, 0, sizeof(pol));
+        pol.fd = sockfd;
+        pol.events = POLLIN;
+        poll_rc = poll(&pol, 1, 100);
+        if (poll_rc == 0)
+        {
+            DEBUG_MESSAGE("Poll timed out\n");
+        }
+        else if (poll_rc < 0)
+        {
+            int err = errno;
+            DEBUG_MESSAGE("Can't check for listening on ping port: %s\n",
+                          strerror(err));
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "Error checking ping to get socket requirements: %s",
+                     strerror(err));
+        }
+        /*
+        if ( recvfrom(sockfd, &pckt, sizeof(pckt), 0,
+                      (struct sockaddr*)&r_addr, &addr_len) <= 0 )
+            printf("\nPacket receive failed!\n");
+        */
+    }
+    close(sockfd);
+    if (poll_rc == 0)
+    {
+        DEBUG_MESSAGE("Timed out waiting for ping response\n");
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Timed out waiting for ping response");
+        poll_rc = -1;
+    }
+    return (poll_rc == -1) ? -1 : 0;
 }
 
 int find_map_fd(xdp_prog_t *prog, struct bpf_object *bpf_obj, const char *mapname)
@@ -885,9 +983,9 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
     }
     if (!found_index)
     {
-        DEBUG_MESSAGE("Can't find map entry of successful connect\n");
+        DEBUG_MESSAGE("Can't find map entry of successful ping\n");
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can not find map entry of successful connect");
+                 "Can not find map entry of successful ping");
         return NULL;
     }
 
@@ -932,8 +1030,12 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
         detach_ping(prog, 0);
         return NULL;
     }
-    DEBUG_MESSAGE("xdp_get_socket_reqs - send_tcp\n");
-    if (send_connect(prog, addr, addrLen, addr_bind))
+    DEBUG_MESSAGE("xdp_get_socket_reqs - send_ping\n");
+    if (!addr_bind)
+        addr_bind = (addrLen == sizeof(struct sockaddr_in)) ?
+            (struct sockaddr *)&prog->m_if[enabled_if].m_sa_in :
+            (struct sockaddr *)&prog->m_if[enabled_if].m_sa_in6;
+    if (send_ping(prog, addr, addrLen, addr_bind))
     {
         detach_ping(prog, 0);
         return NULL;
@@ -1236,6 +1338,8 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
         iphdr->protocol = 17; // UDP
         iphdr->check = 0;
         iphdr->check = checksum(iphdr, sizeof(struct iphdr));
+        DEBUG_MESSAGE("TX: addr: %p, port: %d\n", addr,
+                      addr ? __constant_htons(((struct sockaddr_in *)addr)->sin_port) : 0);
         if (addr && ((struct sockaddr_in *)addr)->sin_port)
         {
             port = ((struct sockaddr_in *)addr)->sin_port;
@@ -1402,6 +1506,143 @@ int process_arp(xdp_socket_t *sock, char *pkt, int len)
     return tx_only(sock, pkt_out, sizeof(*eth_out) + sizeof(*arpe_out), 1);
 }
 
+int process_tcp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
+                int *header_pos)
+{
+    struct ethhdr *eth = (struct ethhdr *)pkt;
+    void *data;
+    void *pkt_out;
+    struct tcphdr *tcp = (struct tcphdr *)(pkt + *header_pos);
+    struct ethhdr *eth_out;
+    struct iphdr *iph_out;
+    struct tcphdr *tcp_out;
+    int send_pos;
+    int i;
+
+    (*header_pos) += sizeof(*tcp);
+    for (i = 1; i <= sock->m_xdp_prog->m_max_if; ++i)
+    {
+        if (!sock->m_xdp_prog->m_if[i].m_disable &&
+            sock->m_xdp_prog->m_if[i].m_sa_in.sin_family == AF_INET &&
+            sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr == iph->daddr)
+            break;
+    }
+    if (i > sock->m_xdp_prog->m_max_if)
+    {
+        DEBUG_MESSAGE("Target IP not found\n");
+        return 0;
+    }
+    data = xdp_get_send_buffer(sock);
+    if (!data)
+        return -1;
+    pkt_out = (char *)data - xdp_send_udp_headroom(sock);
+    eth_out = (struct ethhdr *)pkt_out;
+    send_pos = sizeof(*eth_out);
+    iph_out = (struct iphdr *)(eth_out + 1);
+    send_pos += sizeof(*iph_out);
+    memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
+    memcpy(eth_out->h_source,
+           sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
+           sizeof(eth_out->h_source));
+    eth_out->h_proto = eth->h_proto;
+    iph_out->version = 4;
+    iph_out->ihl = 5;
+    iph_out->tos = 0;
+	iph_out->tot_len = __constant_htons(40); // From a test
+	iph_out->id = __constant_htons(__constant_htons(iph->id) + 1); // From a test
+	iph_out->frag_off = iph->frag_off;
+    iph_out->ttl = iph->ttl;
+	iph_out->protocol = iph->protocol;
+	iph_out->check = 0;
+	iph_out->saddr = iph->daddr;
+	iph_out->daddr = iph->saddr;
+    iph_out->check = checksum(iph_out, sizeof(*iph));
+    tcp_out = (struct tcphdr *)(iph_out + 1);
+    memset(tcp_out, 0, sizeof(*tcp_out));
+    send_pos += sizeof(*tcp_out);
+    tcp_out->source = tcp->dest;
+	tcp_out->dest = tcp->source;
+    tcp_out->seq = 0; // From a test
+    tcp_out->ack_seq = __constant_htonl(__constant_htonl(tcp->seq) + 1);
+    tcp_out->doff = 5;
+    tcp_out->rst = 1; // reset
+    tcp_out->ack = 1;
+    tcp_out->window = 0;
+    tcp_out->check = checksum(tcp_out, sizeof(*tcp_out));
+    DEBUG_MESSAGE("Doing send on pkt_out: %p, %d bytes\n", pkt_out, send_pos);
+    return tx_only(sock, pkt_out, send_pos, 1);
+}
+
+int process_icmp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
+                 int *header_pos)
+{
+    struct ethhdr *eth = (struct ethhdr *)pkt;
+    void *data;
+    void *pkt_out;
+    struct icmphdr *icmp = (struct icmphdr *)(pkt + *header_pos);
+    struct ethhdr *eth_out;
+    struct iphdr *iph_out;
+    struct icmphdr *icmp_out;
+    int send_pos;
+    int i;
+    int icmp_data_len;
+
+    for (i = 1; i <= sock->m_xdp_prog->m_max_if; ++i)
+    {
+        if (!sock->m_xdp_prog->m_if[i].m_disable &&
+            sock->m_xdp_prog->m_if[i].m_sa_in.sin_family == AF_INET &&
+            sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr == iph->daddr)
+            break;
+    }
+    if (i > sock->m_xdp_prog->m_max_if)
+    {
+        DEBUG_MESSAGE("Target IP not found\n");
+        return 0;
+    }
+    if (icmp->type != ICMP_ECHO)
+    {
+        DEBUG_MESSAGE("NOT an echo request\n");
+        return 0;
+    }
+    data = xdp_get_send_buffer(sock);
+    if (!data)
+        return -1;
+    pkt_out = (char *)data - xdp_send_udp_headroom(sock);
+    eth_out = (struct ethhdr *)pkt_out;
+    send_pos = sizeof(*eth_out);
+    iph_out = (struct iphdr *)(eth_out + 1);
+    send_pos += sizeof(*iph_out);
+    memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
+    memcpy(eth_out->h_source,
+           sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
+           sizeof(eth_out->h_source));
+    eth_out->h_proto = eth->h_proto;
+    iph_out->version = 4;
+    iph_out->ihl = 5;
+    iph_out->tos = 0;
+	iph_out->tot_len = iph->tot_len;
+	iph_out->id = __constant_htons(__constant_htons(iph->id) + 1); // From a test
+	iph_out->frag_off = iph->frag_off;
+    iph_out->ttl = iph->ttl;
+	iph_out->protocol = iph->protocol;
+	iph_out->check = 0;
+	iph_out->saddr = iph->daddr;
+	iph_out->daddr = iph->saddr;
+    iph_out->check = checksum(iph_out, sizeof(*iph));
+    icmp_out = (struct icmphdr *)(iph_out + 1);
+    memset(icmp_out, 0, sizeof(*icmp_out));
+    icmp_out->type = ICMP_ECHOREPLY;
+    icmp_out->code = 0;
+    icmp_out->checksum = 0;
+    icmp_data_len = len - *header_pos - 4;
+    send_pos += (icmp_data_len) + 4;
+    DEBUG_MESSAGE("Use remaining length as: %d\n", icmp_data_len);
+    memcpy(&icmp_out->un, &icmp->un, icmp_data_len);
+    icmp_out->checksum = checksum(icmp_out, icmp_data_len + 4);
+    DEBUG_MESSAGE("Doing send on pkt_out: %p, %d bytes\n", pkt_out, send_pos);
+    return tx_only(sock, pkt_out, send_pos, 1);
+}
+
 int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
                       struct sockaddr *addr, socklen_t *addrlen)
 {
@@ -1416,12 +1657,27 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
     if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_IP))
     {
         struct iphdr *iph = (struct iphdr *)(pkt + *header_pos);
+        struct udphdr *udph = (struct udphdr *)(iph + 1);
         int hdrsize = iph->ihl * 4;
         *header_pos += hdrsize;
         if (len < *header_pos)
         {
             DEBUG_MESSAGE("Recv Packet too small to be UDP IPv4\n");
             return 1;
+        }
+        if (iph->protocol == IPPROTO_ICMP)
+        {
+            DEBUG_MESSAGE("ICMP, must reply!\n");
+            if (process_icmp(sock, pkt, len, iph, header_pos) == -1)
+                return -1;
+            return 1; // To avoid further processing
+        }
+        if (iph->protocol == IPPROTO_TCP)
+        {
+            DEBUG_MESSAGE("TCP, must deny it\n");
+            if (process_tcp(sock, pkt, len, iph, header_pos) == -1)
+                return -1;
+            return 1; // To avoid further processing
         }
         if (iph->protocol != IPPROTO_UDP)
         {
@@ -1432,16 +1688,20 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
         {
             ((struct sockaddr_in *)addr)->sin_family = AF_INET;
             ((struct sockaddr_in *)addr)->sin_addr.s_addr = iph->saddr;
+            ((struct sockaddr_in *)addr)->sin_port = udph->source;
+            DEBUG_MESSAGE("Recv save address and port to %p\n", addr);
         }
-        DEBUG_MESSAGE("Recv Remote addr %u.%u.%u.%u\n",
+        DEBUG_MESSAGE("Recv Remote addr %u.%u.%u.%u:%d\n",
                       ((unsigned char *)&iph->saddr)[0],
                       ((unsigned char *)&iph->saddr)[1],
                       ((unsigned char *)&iph->saddr)[2],
-                      ((unsigned char *)&iph->saddr)[3]);
+                      ((unsigned char *)&iph->saddr)[3],
+                      __constant_htons(udph->source));
     }
     else if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_IPV6))
     {
         struct ipv6hdr *ip6h = (struct ipv6hdr *)(pkt + *header_pos);
+        struct udphdr *udph = (struct udphdr *)(ip6h + 1);
         *header_pos += sizeof(struct ipv6hdr);
         if (len < *header_pos)
         {
@@ -1450,7 +1710,9 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
         }
         if (ip6h->nexthdr != IPPROTO_UDP)
         {
-            DEBUG_MESSAGE("Recv not UDP (IPv6)\n");
+            // TODO: MUST HANDLE TCP on IPv6
+            // TODO: MUST HANDLE ICMP on IPv6
+            DEBUG_MESSAGE("Recv not UDP (IPv6) protocol: %d\n", ip6h->nexthdr);
             return 1;
         }
         if (addr && addrlen && *addrlen > sizeof(struct sockaddr_in6))
@@ -1458,6 +1720,9 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
             ((struct sockaddr_in6 *)addr)->sin6_family = AF_INET6;
             memcpy(&((struct sockaddr_in6 *)addr)->sin6_addr, &ip6h->saddr,
                    sizeof(struct in6_addr));
+            ((struct sockaddr_in6 *)addr)->sin6_port = udph->source;
+            DEBUG_MESSAGE("Recv save address and port (%d)\n",
+                          __constant_htons(udph->source));
         }
     }
     else if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_ARP))

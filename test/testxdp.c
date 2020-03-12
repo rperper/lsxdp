@@ -2,15 +2,17 @@
 
 #include <poll.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+
+// To avoid including <arpa/inet.h> which conflicts with lsxdp
+uint16_t htons(uint16_t hostshort);
+int inet_aton(const char *cp, struct in_addr *inp);
 
 void usage()
 {
     printf("Usage: testxdp [-beinopw]\n");
     printf("Where:\n");
     printf("   -b <addr> Optional parameter of local IP addr to bind on during discovery\n");
+    printf("   -d Turns on debugging\n");
     printf("   -e <interface name> allows you to specify 1 interface name\n");
     printf("   -i <addr> to connect to\n");
     printf("   -n is to NOT unload after initializing\n");
@@ -134,23 +136,26 @@ int do_recv(xdp_prog_t *prog, xdp_socket_t *sock, struct sockaddr_in6 *sa)
         else
         {
             void *buffer;
-            int sa_len = sizeof(*sa);
+            socklen_t sa_len = sizeof(*sa);
             int sz;
-            ret = 0;
             printf("\nPoll successful (ret: %d), doing receive\n", ret);
             ret = xdp_recv(sock, &buffer, &sz, (struct sockaddr *)sa, &sa_len);
-            if (ret)
+            if (ret < 0)
             {
                 printf("Error in xdp_recv: %s\n", xdp_get_last_error(prog));
                 break;
             }
             else if (!buffer)
+            {
+                ret = 0;
                 continue;
+            }
             else if (xdp_recv_return(sock, buffer))
             {
                 printf("Error in xdp_recv_return: %s\n", xdp_get_last_error(prog));
                 break;
             }
+            ret = 0;
         }
     }
     return ret;
@@ -179,12 +184,16 @@ int main(int argc, char **argv)
     struct sockaddr_in6 sa_comm;
 
     memset(&sa_comm, 0, sizeof(sa_comm));
-    while ((opt = getopt(argc, argv, "b:e:i:nop:rw")) != -1)
+    while ((opt = getopt(argc, argv, "b:de:i:nop:rw")) != -1)
     {
         switch (opt)
         {
             case 'b':
                 addr_bin = strdup(optarg);
+                break;
+            case 'd':
+                xdp_debug(1);
+                printf("Debugging on\n");
                 break;
             case 'e':
                 ifn = strdup(optarg);
@@ -225,7 +234,7 @@ int main(int argc, char **argv)
         printf("Calling xdp_get_socket_reqs using addr: %s\n", addr);
         memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
-        sa.sin_port = htons(80);
+        sa.sin_port = htons(atoi(port));
         if (!inet_aton(addr, (struct in_addr *)&sa.sin_addr.s_addr))
         {
             printf("Invalid IP address\n");
@@ -243,7 +252,7 @@ int main(int argc, char **argv)
             }
         }
         reqs = xdp_get_socket_reqs(prog, (struct sockaddr *)&sa, sizeof(sa),
-                                   (struct sockaddr *)(addr_bin ? &sa_bind : NULL),
+                                   (struct sockaddr *)(!recv_only ? &sa_bind : NULL),
                                    ifn);
         if (!reqs)
         {

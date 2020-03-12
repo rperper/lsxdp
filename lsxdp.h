@@ -83,9 +83,11 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port);
  *                 For accept type connections, MUST be NULL.
  * @param[in] addrLen The address length (as for connect)
  * @param[in] addr_bind An optional parameter of the local address to use.  The
- *            length is assumed to be the same as the addrLen above.
+ *            length is assumed to be the same as the addrLen above.  For
+ *            sending you must specify either the addr_bind or the ifport.
  * @param[in] ifport Optional ethernet system port to use (required for
- *            listening).
+ *            listening).  For sending, you must specify either the addr_bind
+ *            or the ifport.
  * @returns A pointer to lsxdp_socket_reqs_t if successful or NULL if not.
  * This pointer MUST be freed with a free() call when done.
  * @warning This function waits for up to 5 seconds for a packet response to
