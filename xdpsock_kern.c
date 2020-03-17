@@ -25,6 +25,7 @@ struct bpf_map_def SEC("maps") xsks_map = {
 SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 {
     int index = ctx->rx_queue_index;
+    /* ALL BELOW IS DEBUGGING STUFF! */
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
     int h_proto;
@@ -75,6 +76,7 @@ out:
 	//rr = (rr + 1) & (MAX_SOCKS - 1);
 
 	//return bpf_redirect_map(&xsks_map, rr, XDP_PASS);
+	// END OF DEBUGGING STUFF */
     /* A set entry here means that the correspnding queue_id
      * has an active AF_XDP socket bound to it. */
     if (bpf_map_lookup_elem(&xsks_map, &index))

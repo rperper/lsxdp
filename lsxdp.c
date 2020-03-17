@@ -714,38 +714,6 @@ static unsigned short checksum(void *b, int len)
     return result;
 }
 
-/*
-static int send_connect(xdp_prog_t *prog, const struct sockaddr *addr,
-                        socklen_t addrLen, const struct sockaddr *addr_bind)
-{
-    int sockfd;
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0)
-    {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Error creating socket to get socket requirements: %s",
-                 strerror(errno));
-        return -1;
-    }
-    if (addr_bind)
-    {
-        DEBUG_MESSAGE("Doing bind\n");
-        if (bind(sockfd, addr_bind, addrLen) < 0)
-            DEBUG_MESSAGE("BIND FAILED: %s, but continue anyway\n",
-                          strerror(errno));
-    }
-    DEBUG_MESSAGE("Doing connect\n");
-    if (connect(sockfd, addr, addrLen) < 0)
-        DEBUG_MESSAGE("connect failed: %s, but not necessarily bad\n",
-                      strerror(errno));
-    else
-        DEBUG_MESSAGE("connect worked\n");
-    close(sockfd);
-    return 0;
-}
-*/
-
 #define PING_PKT_S 64
 struct ping_pkt
 {
@@ -1143,9 +1111,6 @@ static inline int complete_tx_only(xdp_socket_t *sock, int *released)
     int was_busy_send = sock->m_busy_send;
 
     *released = 0;
-    //DEBUG_MESSAGE("TX: kick_tx\n");
-    //if (!sock->m_sock_info->outstanding_tx)
-    //    return 0;
     if (kick_tx(sock))
         return -1;
     if (was_busy_send)
@@ -1225,6 +1190,7 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
     int index = -1;
     void *buffer;
 
+    /*
     {
         int rc;
         struct pollfd p;
@@ -1237,6 +1203,7 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
         if (rc == 1 && p.revents != POLLIN)
             DEBUG_MESSAGE("UNEXPECTED RECEIVED EVENT: %d\n", p.revents);
     }
+    */
     if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
         index = sock->m_umem->m_tx_count;
     else
@@ -1458,7 +1425,7 @@ int process_arp(xdp_socket_t *sock, char *pkt, int len)
     void *pkt_out;
     struct ethhdr *eth_out;
     struct arp_eth *arpe_out;
-    int i;
+    int i = sock->m_reqs->m_ifindex;
 
     DEBUG_MESSAGE("ARP\n");
     if (len < sizeof(*eth) + sizeof(*arpe))
@@ -1466,21 +1433,17 @@ int process_arp(xdp_socket_t *sock, char *pkt, int len)
         DEBUG_MESSAGE("Message too small for ARP, ignore\n");
         return 0;
     }
-    if (memcmp(eth->h_dest, "\xff\xff\xff\xff\xff\xff", 6))
+    if (memcmp(eth->h_dest, "\xff\xff\xff\xff\xff\xff", 6) &&
+        memcmp(eth->h_dest, sock->m_xdp_prog->m_if[i].m_mac, 6))
     {
-        DEBUG_MESSAGE("ARP not broadcast, ignore\n");
+        DEBUG_MESSAGE("ARP not broadcast and not me, ignore\n");
         return 0;
     }
-    for (i = 1; i <= sock->m_xdp_prog->m_max_if; ++i)
+    if (sock->m_xdp_prog->m_if[i].m_disable ||
+        sock->m_xdp_prog->m_if[i].m_sa_in.sin_family != AF_INET ||
+        sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr != *(__u32 *)arpe->ar_tip)
     {
-        if (!sock->m_xdp_prog->m_if[i].m_disable &&
-            sock->m_xdp_prog->m_if[i].m_sa_in.sin_family == AF_INET &&
-            sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr == *(__u32 *)arpe->ar_tip)
-            break;
-    }
-    if (i > sock->m_xdp_prog->m_max_if)
-    {
-        DEBUG_MESSAGE("Target IP not found\n");
+        DEBUG_MESSAGE("Address IP not right\n");
         return 0;
     }
     data = xdp_get_send_buffer(sock);
@@ -1490,8 +1453,7 @@ int process_arp(xdp_socket_t *sock, char *pkt, int len)
     eth_out = (struct ethhdr *)pkt_out;
     arpe_out = (struct arp_eth *)(eth_out + 1);
     memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
-    memcpy(eth_out->h_source,
-           sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
+    memcpy(eth_out->h_source, sock->m_xdp_prog->m_if[i].m_mac,
            sizeof(eth_out->h_source));
     eth_out->h_proto = eth->h_proto;
     arpe_out->ar_hrd = arpe->ar_hrd;
@@ -1517,19 +1479,14 @@ int process_tcp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
     struct iphdr *iph_out;
     struct tcphdr *tcp_out;
     int send_pos;
-    int i;
+    int i = sock->m_reqs->m_ifindex;
 
     (*header_pos) += sizeof(*tcp);
-    for (i = 1; i <= sock->m_xdp_prog->m_max_if; ++i)
+    if (sock->m_xdp_prog->m_if[i].m_disable ||
+        sock->m_xdp_prog->m_if[i].m_sa_in.sin_family != AF_INET ||
+        sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr != iph->daddr)
     {
-        if (!sock->m_xdp_prog->m_if[i].m_disable &&
-            sock->m_xdp_prog->m_if[i].m_sa_in.sin_family == AF_INET &&
-            sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr == iph->daddr)
-            break;
-    }
-    if (i > sock->m_xdp_prog->m_max_if)
-    {
-        DEBUG_MESSAGE("Target IP not found\n");
+        DEBUG_MESSAGE("Address IP not right\n");
         return 0;
     }
     data = xdp_get_send_buffer(sock);
@@ -1541,8 +1498,7 @@ int process_tcp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
     iph_out = (struct iphdr *)(eth_out + 1);
     send_pos += sizeof(*iph_out);
     memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
-    memcpy(eth_out->h_source,
-           sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
+    memcpy(eth_out->h_source, sock->m_xdp_prog->m_if[i].m_mac,
            sizeof(eth_out->h_source));
     eth_out->h_proto = eth->h_proto;
     iph_out->version = 4;
@@ -1584,19 +1540,14 @@ int process_icmp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
     struct iphdr *iph_out;
     struct icmphdr *icmp_out;
     int send_pos;
-    int i;
+    int i = sock->m_reqs->m_ifindex;
     int icmp_data_len;
 
-    for (i = 1; i <= sock->m_xdp_prog->m_max_if; ++i)
+    if (sock->m_xdp_prog->m_if[i].m_disable ||
+        sock->m_xdp_prog->m_if[i].m_sa_in.sin_family != AF_INET ||
+        sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr != iph->daddr)
     {
-        if (!sock->m_xdp_prog->m_if[i].m_disable &&
-            sock->m_xdp_prog->m_if[i].m_sa_in.sin_family == AF_INET &&
-            sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr == iph->daddr)
-            break;
-    }
-    if (i > sock->m_xdp_prog->m_max_if)
-    {
-        DEBUG_MESSAGE("Target IP not found\n");
+        DEBUG_MESSAGE("IP Address not right\n");
         return 0;
     }
     if (icmp->type != ICMP_ECHO)
@@ -1613,8 +1564,7 @@ int process_icmp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
     iph_out = (struct iphdr *)(eth_out + 1);
     send_pos += sizeof(*iph_out);
     memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
-    memcpy(eth_out->h_source,
-           sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
+    memcpy(eth_out->h_source, sock->m_xdp_prog->m_if[i].m_mac,
            sizeof(eth_out->h_source));
     eth_out->h_proto = eth->h_proto;
     iph_out->version = 4;

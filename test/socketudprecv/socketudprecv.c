@@ -108,6 +108,7 @@ int recv_file(int fd)
     int sd;
     int rc = -1;
     size_t total = 0;
+
     printf("Receiving...\n");
 #ifndef WIN32
     struct timeval tv_start, tv_end;
@@ -190,7 +191,7 @@ int main(
         case 's':
             if (arg + 1 > argc)
             {
-                printf("You must specify a parameter for -s\n");
+                printf("You must specify a string to send for -s\n");
                 usage();
                 return 1;
             }
@@ -207,7 +208,7 @@ int main(
         case 'g':
             if (arg + 1 > arc)
             {
-                printf("You must specify a parameter for -g\n");
+                printf("You must specify a file name for -g\n");
                 usage();
                 return 1;
             }
@@ -332,16 +333,6 @@ int main(
             ReportError("accept failed");
             return 1;
         }
-        else if (tcp_file_get)
-        {
-            printf("Send file name\n");
-            if (send(sock, tcp_file_get, strlen(tcp_file_get), 0) < 0)
-            {
-                ReportError("Error sending file name");
-                return 1;
-            }
-            recv_file(sock);
-        }
         else
         {
             printf("Doing connect\n");
@@ -355,6 +346,16 @@ int main(
                     ReportError("send failed");
                 else
                     printf("send worked!\n");
+            }
+            else if (tcp_file_get)
+            {
+                printf("Send file name\n");
+                if (send(sock, tcp_file_get, strlen(tcp_file_get), 0) < 0)
+                {
+                    ReportError("Error sending file name");
+                    return 1;
+                }
+                recv_file(sock);
             }
         }
     }

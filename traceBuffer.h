@@ -1,14 +1,14 @@
 static void traceBuffer(const char *buf, int sz)
 {
+#ifdef DEBUG_ON
+    if (!DEBUG_ON)
+        return;
+#endif
     int buf_len = (((sz + 15) / 16) * 16) * 2 + ((sz + 15) / 16) * (6 + 3 + 1 + 16 + 1) + 1;
     char buffer[buf_len];
     buffer[0] = 0;
     unsigned char *in = (unsigned char *)buf;
     int  buf_idx = 0;
-#ifdef DEBUG_ON
-    if (!DEBUG_ON)
-        return;
-#endif
     if (sz > 0xffff)
         sz = 0xffff;
     for (int i = 0; i < sz; i = i + 16)
