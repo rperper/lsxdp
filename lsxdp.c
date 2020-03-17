@@ -539,10 +539,10 @@ static int ifport_to_addr_bind(xdp_prog_t *prog,
                 memcpy(addr_bind, &prog->m_if[i].m_sa_in,
                        sizeof(struct sockaddr_in));
                 DEBUG_MESSAGE("Addr for port %s is %u.%u.%u.%u\n", ifport,
-                              ((unsigned char *)&prog->m_if[i].m_sa_in)[0],
-                              ((unsigned char *)&prog->m_if[i].m_sa_in)[1],
-                              ((unsigned char *)&prog->m_if[i].m_sa_in)[2],
-                              ((unsigned char *)&prog->m_if[i].m_sa_in)[3]);
+                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[0],
+                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[1],
+                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[2],
+                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[3]);
                 break;
             }
             if (!ipv4 &&

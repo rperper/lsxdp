@@ -33,6 +33,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     struct ethhdr *eth;
     struct iphdr  *iphdr;
     struct udphdr *udphdr;
+    int af_xdp = 0;
 	nh.pos = data;
 
     bpf_printk("sock_prog ENTRY, index: %d\n", index);
@@ -72,6 +73,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     }
     bpf_printk("sock_prog ports: %d %d\n", bpf_htons(udphdr->source),
                bpf_htons(udphdr->dest));
+    af_xdp = 1;
 out:
 	//rr = (rr + 1) & (MAX_SOCKS - 1);
 
@@ -79,8 +81,14 @@ out:
 	// END OF DEBUGGING STUFF */
     /* A set entry here means that the correspnding queue_id
      * has an active AF_XDP socket bound to it. */
+    if (!af_xdp)
+        goto no_xdp;
+
     if (bpf_map_lookup_elem(&xsks_map, &index))
         return bpf_redirect_map(&xsks_map, index, 0);
+
+no_xdp:
+    bpf_printk("NOT DOING REDIRECT!\n");
 
     return XDP_PASS;
 }
