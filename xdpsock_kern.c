@@ -36,41 +36,38 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     int af_xdp = 0;
 	nh.pos = data;
 
-    bpf_printk("sock_prog ENTRY, index: %d\n", index);
+    //bpf_printk("sock_prog ENTRY, index: %d\n", index);
 	h_proto = parse_ethhdr(&nh, data_end, &eth);
     if (h_proto == bpf_htons(ETH_P_IP))
     {
    		int ip_type = parse_iphdr(&nh, data_end, &iphdr);
 		if (ip_type != IPPROTO_UDP)
         {
-            bpf_printk("sock_prog IP NOT UDP: %d\n", ip_type);
+            //bpf_printk("sock_prog IP NOT UDP: %d\n", ip_type);
 			goto out;
-        }
-        else
-        {
-            bpf_printk("sock_prog IP source: %u.%u",
-                       ((unsigned char *)&iphdr->saddr)[0],
-                       ((unsigned char *)&iphdr->saddr)[1]);
-            bpf_printk("  .%u.%u\n",
-                       ((unsigned char *)&iphdr->saddr)[2],
-                       ((unsigned char *)&iphdr->saddr)[3]);
         }
     }
     else if (h_proto == bpf_htons(ETH_P_IPV6))
     {
-        bpf_printk("sock_prog IPv6\n");
+        //bpf_printk("sock_prog IPv6\n");
 		goto out;
     }
     else
     {
-        bpf_printk("sock_prog parse_ethhdr failed proto: %d\n", bpf_htons(h_proto));
+        bpf_printk("sock_prog parse_ethhdr NOT UDP proto: 0x%x\n", bpf_htons(h_proto));
         goto out;
     }
   	if (parse_udphdr(&nh, data_end, &udphdr) == -1)
     {
-        bpf_printk("sock_prog parse_tcphdr failed\n");
+        //bpf_printk("sock_prog parse_udphdr failed\n");
         goto out;
     }
+    bpf_printk("sock_prog IP source: %u.%u",
+               ((unsigned char *)&iphdr->saddr)[0],
+               ((unsigned char *)&iphdr->saddr)[1]);
+    bpf_printk("  .%u.%u\n",
+               ((unsigned char *)&iphdr->saddr)[2],
+               ((unsigned char *)&iphdr->saddr)[3]);
     bpf_printk("sock_prog ports: %d %d\n", bpf_htons(udphdr->source),
                bpf_htons(udphdr->dest));
     af_xdp = 1;
@@ -79,16 +76,16 @@ out:
 
 	//return bpf_redirect_map(&xsks_map, rr, XDP_PASS);
 	// END OF DEBUGGING STUFF */
-    /* A set entry here means that the correspnding queue_id
-     * has an active AF_XDP socket bound to it. */
     if (!af_xdp)
         goto no_xdp;
 
+    /* A set entry here means that the correspnding queue_id
+     * has an active AF_XDP socket bound to it. */
     if (bpf_map_lookup_elem(&xsks_map, &index))
         return bpf_redirect_map(&xsks_map, index, 0);
 
 no_xdp:
-    bpf_printk("NOT DOING REDIRECT!\n");
+    //bpf_printk("NOT DOING REDIRECT!\n");
 
     return XDP_PASS;
 }

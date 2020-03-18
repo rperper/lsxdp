@@ -12,6 +12,7 @@
 #include "linux/in.h"
 #include "linux/icmp.h"
 #include "linux/ioctl.h"
+#include "linux/rtnetlink.h"
 #include "linux/sockios.h"
 #include "linux/tcp.h"
 #include "net/if.h"
@@ -23,6 +24,8 @@ static int s_xdp_debug = 0;
 
 #define TRACE_BUFFER_DEBUG_MESSAGE
 #include "traceBuffer.h"
+
+#define USE_PING
 
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not set */
                            /*XDP_FLAGS_SKB_MODE | // Generic or emulated (slow)*/
@@ -613,7 +616,7 @@ static int check_if(xdp_prog_t *prog, const char *ifport,
     return 0;
 }
 
-
+#ifdef USE_PING
 static int load_obj(xdp_prog_t *prog, const char *ifport)
 {
 	int err;
@@ -697,6 +700,7 @@ static int load_obj(xdp_prog_t *prog, const char *ifport)
         return -1;
     return 0;
 }
+#endif
 
 static unsigned short checksum(void *b, int len)
 {
@@ -714,6 +718,7 @@ static unsigned short checksum(void *b, int len)
     return result;
 }
 
+#ifdef USE_PING
 #define PING_PKT_S 64
 struct ping_pkt
 {
@@ -809,7 +814,9 @@ static int send_ping(xdp_prog_t *prog, const struct sockaddr *addr,
     }
     return (poll_rc == -1) ? -1 : 0;
 }
+#endif
 
+#ifdef USE_PING
 int find_map_fd(xdp_prog_t *prog, struct bpf_object *bpf_obj, const char *mapname)
 {
     struct bpf_map *map;
@@ -875,6 +882,7 @@ static int set_map(xdp_prog_t *prog, const struct sockaddr *addr,
     }
     return 0;
 }
+#endif
 
 static lsxdp_socket_reqs_t *malloc_reqs(xdp_prog_t *prog, int ifindex)
 {
@@ -891,7 +899,7 @@ static lsxdp_socket_reqs_t *malloc_reqs(xdp_prog_t *prog, int ifindex)
     return reqs;
 }
 
-
+#ifdef USE_PING
 static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
                                       const struct sockaddr *addr,
                                       socklen_t addrLen)
@@ -964,6 +972,7 @@ static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
     memcpy(&reqs->m_rec, &rec, sizeof(rec));
     return reqs;
 }
+#endif
 
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const struct sockaddr *addr,
@@ -986,6 +995,8 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
     if (!addr)
     {
         reqs = malloc_reqs(prog, enabled_if);
+        if (!reqs)
+            return NULL;
         reqs->m_sendable = 0;
         return reqs;
     }
@@ -1015,6 +1026,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
         detach_ping(prog, 0);
         return NULL;
     }
+    detach_ping(prog, 0);
     DEBUG_MESSAGE("xdp_get_socket_reqs - WORKED! header size %d "
                   "source mac: %02x:%02x:%02x:%02x:%02x:%02x "
                   "dest mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -1032,7 +1044,6 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[4],
                   ((struct ethhdr *)reqs->m_rec.m_header)->h_dest[5]);
     traceBuffer(reqs->m_rec.m_header, reqs->m_rec.m_header_size);
-    detach_ping(prog, 0);
     return reqs;
 }
 
@@ -1400,199 +1411,6 @@ int xdp_send_udp_headroom(xdp_socket_t *sock)
     return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
 }
 
-struct arp_eth
-{
-	__be16		ar_hrd;		/* format of hardware address	*/
-	__be16		ar_pro;		/* format of protocol address	*/
-	unsigned char	ar_hln;		/* length of hardware address	*/
-	unsigned char	ar_pln;		/* length of protocol address	*/
-	__be16		ar_op;		/* ARP opcode (command)		*/
-
-	 /*
-	  *	 Ethernet looks like this : This bit is variable sized however...
-	  */
-	unsigned char		ar_sha[ETH_ALEN];	/* sender hardware address	*/
-	unsigned char		ar_sip[4];		/* sender IP address		*/
-	unsigned char		ar_tha[ETH_ALEN];	/* target hardware address	*/
-	unsigned char		ar_tip[4];		/* target IP address		*/
-} __attribute__((packed));
-
-int process_arp(xdp_socket_t *sock, char *pkt, int len)
-{
-    struct ethhdr *eth = (struct ethhdr *)pkt;
-    struct arp_eth *arpe = (struct arp_eth *)&pkt[sizeof(struct ethhdr)];
-    void *data;
-    void *pkt_out;
-    struct ethhdr *eth_out;
-    struct arp_eth *arpe_out;
-    int i = sock->m_reqs->m_ifindex;
-
-    DEBUG_MESSAGE("ARP\n");
-    if (len < sizeof(*eth) + sizeof(*arpe))
-    {
-        DEBUG_MESSAGE("Message too small for ARP, ignore\n");
-        return 0;
-    }
-    if (memcmp(eth->h_dest, "\xff\xff\xff\xff\xff\xff", 6) &&
-        memcmp(eth->h_dest, sock->m_xdp_prog->m_if[i].m_mac, 6))
-    {
-        DEBUG_MESSAGE("ARP not broadcast and not me, ignore\n");
-        return 0;
-    }
-    if (sock->m_xdp_prog->m_if[i].m_disable ||
-        sock->m_xdp_prog->m_if[i].m_sa_in.sin_family != AF_INET ||
-        sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr != *(__u32 *)arpe->ar_tip)
-    {
-        DEBUG_MESSAGE("Address IP not right\n");
-        return 0;
-    }
-    data = xdp_get_send_buffer(sock);
-    if (!data)
-        return -1;
-    pkt_out = (char *)data - xdp_send_udp_headroom(sock);
-    eth_out = (struct ethhdr *)pkt_out;
-    arpe_out = (struct arp_eth *)(eth_out + 1);
-    memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
-    memcpy(eth_out->h_source, sock->m_xdp_prog->m_if[i].m_mac,
-           sizeof(eth_out->h_source));
-    eth_out->h_proto = eth->h_proto;
-    arpe_out->ar_hrd = arpe->ar_hrd;
-    arpe_out->ar_pro = arpe->ar_pro;
-    arpe_out->ar_hln = arpe->ar_hln;
-    arpe_out->ar_pln = arpe->ar_pln;
-    arpe_out->ar_op = __constant_htons(2); // reply
-    memcpy(arpe_out->ar_sha, sock->m_xdp_prog->m_if[i].m_mac, sizeof(arpe_out->ar_sha));
-    memcpy(arpe_out->ar_sip, arpe->ar_tip, sizeof(arpe_out->ar_sip));
-    memcpy(arpe_out->ar_tha, arpe->ar_sha, sizeof(arpe_out->ar_tha));
-    memcpy(arpe_out->ar_tip, arpe->ar_sip, sizeof(arpe_out->ar_tip));
-    return tx_only(sock, pkt_out, sizeof(*eth_out) + sizeof(*arpe_out), 1);
-}
-
-int process_tcp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
-                int *header_pos)
-{
-    struct ethhdr *eth = (struct ethhdr *)pkt;
-    void *data;
-    void *pkt_out;
-    struct tcphdr *tcp = (struct tcphdr *)(pkt + *header_pos);
-    struct ethhdr *eth_out;
-    struct iphdr *iph_out;
-    struct tcphdr *tcp_out;
-    int send_pos;
-    int i = sock->m_reqs->m_ifindex;
-
-    (*header_pos) += sizeof(*tcp);
-    if (sock->m_xdp_prog->m_if[i].m_disable ||
-        sock->m_xdp_prog->m_if[i].m_sa_in.sin_family != AF_INET ||
-        sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr != iph->daddr)
-    {
-        DEBUG_MESSAGE("Address IP not right\n");
-        return 0;
-    }
-    data = xdp_get_send_buffer(sock);
-    if (!data)
-        return -1;
-    pkt_out = (char *)data - xdp_send_udp_headroom(sock);
-    eth_out = (struct ethhdr *)pkt_out;
-    send_pos = sizeof(*eth_out);
-    iph_out = (struct iphdr *)(eth_out + 1);
-    send_pos += sizeof(*iph_out);
-    memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
-    memcpy(eth_out->h_source, sock->m_xdp_prog->m_if[i].m_mac,
-           sizeof(eth_out->h_source));
-    eth_out->h_proto = eth->h_proto;
-    iph_out->version = 4;
-    iph_out->ihl = 5;
-    iph_out->tos = 0;
-	iph_out->tot_len = __constant_htons(40); // From a test
-	iph_out->id = __constant_htons(__constant_htons(iph->id) + 1); // From a test
-	iph_out->frag_off = iph->frag_off;
-    iph_out->ttl = iph->ttl;
-	iph_out->protocol = iph->protocol;
-	iph_out->check = 0;
-	iph_out->saddr = iph->daddr;
-	iph_out->daddr = iph->saddr;
-    iph_out->check = checksum(iph_out, sizeof(*iph));
-    tcp_out = (struct tcphdr *)(iph_out + 1);
-    memset(tcp_out, 0, sizeof(*tcp_out));
-    send_pos += sizeof(*tcp_out);
-    tcp_out->source = tcp->dest;
-	tcp_out->dest = tcp->source;
-    tcp_out->seq = 0; // From a test
-    tcp_out->ack_seq = __constant_htonl(__constant_htonl(tcp->seq) + 1);
-    tcp_out->doff = 5;
-    tcp_out->rst = 1; // reset
-    tcp_out->ack = 1;
-    tcp_out->window = 0;
-    tcp_out->check = checksum(tcp_out, sizeof(*tcp_out));
-    DEBUG_MESSAGE("Doing send on pkt_out: %p, %d bytes\n", pkt_out, send_pos);
-    return tx_only(sock, pkt_out, send_pos, 1);
-}
-
-int process_icmp(xdp_socket_t *sock, char *pkt, int len, struct iphdr *iph,
-                 int *header_pos)
-{
-    struct ethhdr *eth = (struct ethhdr *)pkt;
-    void *data;
-    void *pkt_out;
-    struct icmphdr *icmp = (struct icmphdr *)(pkt + *header_pos);
-    struct ethhdr *eth_out;
-    struct iphdr *iph_out;
-    struct icmphdr *icmp_out;
-    int send_pos;
-    int i = sock->m_reqs->m_ifindex;
-    int icmp_data_len;
-
-    if (sock->m_xdp_prog->m_if[i].m_disable ||
-        sock->m_xdp_prog->m_if[i].m_sa_in.sin_family != AF_INET ||
-        sock->m_xdp_prog->m_if[i].m_sa_in.sin_addr.s_addr != iph->daddr)
-    {
-        DEBUG_MESSAGE("IP Address not right\n");
-        return 0;
-    }
-    if (icmp->type != ICMP_ECHO)
-    {
-        DEBUG_MESSAGE("NOT an echo request\n");
-        return 0;
-    }
-    data = xdp_get_send_buffer(sock);
-    if (!data)
-        return -1;
-    pkt_out = (char *)data - xdp_send_udp_headroom(sock);
-    eth_out = (struct ethhdr *)pkt_out;
-    send_pos = sizeof(*eth_out);
-    iph_out = (struct iphdr *)(eth_out + 1);
-    send_pos += sizeof(*iph_out);
-    memcpy(eth_out->h_dest, eth->h_source, sizeof(eth_out->h_dest));
-    memcpy(eth_out->h_source, sock->m_xdp_prog->m_if[i].m_mac,
-           sizeof(eth_out->h_source));
-    eth_out->h_proto = eth->h_proto;
-    iph_out->version = 4;
-    iph_out->ihl = 5;
-    iph_out->tos = 0;
-	iph_out->tot_len = iph->tot_len;
-	iph_out->id = __constant_htons(__constant_htons(iph->id) + 1); // From a test
-	iph_out->frag_off = iph->frag_off;
-    iph_out->ttl = iph->ttl;
-	iph_out->protocol = iph->protocol;
-	iph_out->check = 0;
-	iph_out->saddr = iph->daddr;
-	iph_out->daddr = iph->saddr;
-    iph_out->check = checksum(iph_out, sizeof(*iph));
-    icmp_out = (struct icmphdr *)(iph_out + 1);
-    memset(icmp_out, 0, sizeof(*icmp_out));
-    icmp_out->type = ICMP_ECHOREPLY;
-    icmp_out->code = 0;
-    icmp_out->checksum = 0;
-    icmp_data_len = len - *header_pos - 4;
-    send_pos += (icmp_data_len) + 4;
-    DEBUG_MESSAGE("Use remaining length as: %d\n", icmp_data_len);
-    memcpy(&icmp_out->un, &icmp->un, icmp_data_len);
-    icmp_out->checksum = checksum(icmp_out, icmp_data_len + 4);
-    DEBUG_MESSAGE("Doing send on pkt_out: %p, %d bytes\n", pkt_out, send_pos);
-    return tx_only(sock, pkt_out, send_pos, 1);
-}
-
 int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
                       struct sockaddr *addr, socklen_t *addrlen)
 {
@@ -1614,20 +1432,6 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
         {
             DEBUG_MESSAGE("Recv Packet too small to be UDP IPv4\n");
             return 1;
-        }
-        if (iph->protocol == IPPROTO_ICMP)
-        {
-            DEBUG_MESSAGE("ICMP, must reply!\n");
-            if (process_icmp(sock, pkt, len, iph, header_pos) == -1)
-                return -1;
-            return 1; // To avoid further processing
-        }
-        if (iph->protocol == IPPROTO_TCP)
-        {
-            DEBUG_MESSAGE("TCP, must deny it\n");
-            if (process_tcp(sock, pkt, len, iph, header_pos) == -1)
-                return -1;
-            return 1; // To avoid further processing
         }
         if (iph->protocol != IPPROTO_UDP)
         {
@@ -1660,8 +1464,6 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
         }
         if (ip6h->nexthdr != IPPROTO_UDP)
         {
-            // TODO: MUST HANDLE TCP on IPv6
-            // TODO: MUST HANDLE ICMP on IPv6
             DEBUG_MESSAGE("Recv not UDP (IPv6) protocol: %d\n", ip6h->nexthdr);
             return 1;
         }
@@ -1674,11 +1476,6 @@ int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len, int *header_pos,
             DEBUG_MESSAGE("Recv save address and port (%d)\n",
                           __constant_htons(udph->source));
         }
-    }
-    else if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_ARP))
-    {
-        process_arp(sock, pkt, len);
-        return 1; // NEVER return anything but 1 - not processing it.
     }
     else
     {
