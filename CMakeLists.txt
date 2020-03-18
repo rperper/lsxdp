@@ -6,6 +6,7 @@ SET(lsxdp_STAT_SRCS
 )
 
 add_custom_target(xdp_sock_kern ALL
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMAND clang -S -O2 -target bpf -D __BPF_TRACING__ -I headers -I libbpf/src -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -emit-llvm -c -g xdpsock_kern.c -o xdpsock_kern.ll
     COMMAND llc -march=bpf -filetype=obj xdpsock_kern.ll -o xdpsock_kern.o
 )
