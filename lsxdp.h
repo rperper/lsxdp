@@ -217,10 +217,20 @@ int xdp_recv_return(xdp_socket_t *sock, void *data);
 /**
  * @fn xdp_socket_close
  * @brief Call to close a socket previously opened with xdp_socket.
- * @param[in] xdp_socket_t The socket previously created with xdp_prog_init\
+ * @param[in] xdp_socket_t The socket previously created with xdp_prog_init
  * @returns None
  **/
 void xdp_socket_close(xdp_socket_t *socket);
+
+/**
+ * @fn xdp_add_ip_filter
+ * @brief Lets you add an IP to accept from.  All other UDP packets are dropped.
+ * @param[in] xdp_socket_t The socket previously created with xdp_prog_init
+ * @param[in] ipkey The IP address to accept.
+ * @returns -1 if the filter can't be added.
+ **/
+int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey);
+
 /**
  * @fn xdp_prog_done
  * @brief Call to close the use of the XDP package system after a successful

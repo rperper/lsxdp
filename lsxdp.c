@@ -457,6 +457,7 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port)
     socket->m_xdp_prog = prog;
     socket->m_reqs = reqs;
     socket->m_reqs->m_port = port;
+    socket->m_filter_map = -1;
     prog->m_num_socks++;
 	if (xsk_configure_umem(prog->m_bufs, socket,
                            NUM_FRAMES * prog->m_max_frame_size))
@@ -1687,6 +1688,36 @@ int xdp_send_completed(xdp_socket_t *sock, int *still_pending)
             *still_pending = 1;
         else
             *still_pending = sock->m_sock_info->outstanding_tx;
+    }
+    return 0;
+}
+
+int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey)
+{
+    int value = 0;
+    if (socket->m_filter_map == -1)
+    {
+        socket->m_filter_map = find_map_fd(socket->m_xdp_prog,
+                                           socket->m_xdp_prog->m_if[socket->m_reqs->m_ifindex].m_bpf_object,
+                                           "ip_key_map");
+        if (socket->m_filter_map == -1)
+        {
+            DEBUG_MESSAGE("xdp_add_ip_filter can't find map\n");
+            snprintf(socket->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "xdp_add_ip_filter can't find map");
+            return -1;
+        }
+    }
+    DEBUG_MESSAGE("xdp_add_ip_filter, family: %d, addr: 0x%x\n", ipkey->family, ipkey->v4_addr);
+
+    if (bpf_map_update_elem(socket->m_filter_map, ipkey, &value, 0) != 0)
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Can't add IP address to map: %s\n", strerror(err));
+        snprintf(socket->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "xdp_add_ip_filter Can't add IP address to map: %s",
+                 strerror(err));
+        return -1;
     }
     return 0;
 }

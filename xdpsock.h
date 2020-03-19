@@ -44,4 +44,13 @@ struct packet_rec
     __u16           m_ip_index;
 };
 
+/* USED FOR IP KEY MAP! */
+struct ip_key {
+    union {
+        __u32 v4_addr;
+        __u8 v6_addr[16];
+    };
+    __u8 family; // 2 for IPv4
+};
+
 #endif /* XDPSOCK_H */

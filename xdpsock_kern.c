@@ -17,6 +17,14 @@ struct bpf_map_def SEC("maps") xsks_map = {
 	.max_entries = MAX_SOCKS,
 };
 
+/* USED FOR IP KEY MAP! */
+struct bpf_map_def SEC("maps") ip_key_map = {
+    .type        = BPF_MAP_TYPE_HASH,
+    .key_size    = sizeof(struct ip_key),
+    .value_size  = sizeof(int),
+    .max_entries = 100,
+    .map_flags   = BPF_F_NO_PREALLOC
+};
 
 /* The 'rr' variable and it's use below is from the sample, but it appears to
  * not be the right way to use AF_XDP.  */
@@ -33,6 +41,8 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     struct ethhdr *eth;
     struct iphdr  *iphdr;
     struct udphdr *udphdr;
+    struct ip_key ipkey = { 0 };
+    int *ipkey_val = NULL;
     int af_xdp = 0;
 	nh.pos = data;
 
@@ -79,10 +89,29 @@ out:
     if (!af_xdp)
         goto no_xdp;
 
+    if (h_proto == bpf_htons(ETH_P_IP))
+    {
+        ipkey.family = 2;//AF_INET;
+        ipkey.v4_addr = iphdr->saddr;
+    }
+    else
+    {
+        bpf_printk("Only IPv4 support so far.  Drop\n");
+        return XDP_DROP;
+    }
+	ipkey_val = bpf_map_lookup_elem(&ip_key_map, &ipkey);
+    if (!ipkey_val)
+    {
+        bpf_printk("Unexpected IP address, drop packet, family: %d, addr: 0x%x\n", ipkey.family, ipkey.v4_addr);
+        return XDP_DROP;
+    }
+    bpf_printk("Expected ip address, count: %d\n", ++*ipkey_val);
+
     /* A set entry here means that the correspnding queue_id
      * has an active AF_XDP socket bound to it. */
     if (bpf_map_lookup_elem(&xsks_map, &index))
         return bpf_redirect_map(&xsks_map, index, 0);
+    bpf_printk("NOT AN AF_XDP SOCKET!\n");
 
 no_xdp:
     //bpf_printk("NOT DOING REDIRECT!\n");
