@@ -155,7 +155,7 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                   shard_base(sock->m_xdp_prog),
                   shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog));
 	for (i = shard_base(sock->m_xdp_prog); i < shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog); i++)
-		*xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx++) =
+		*xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, i/*idx++*/) =
 			i * sock->m_xdp_prog->m_max_frame_size;
 	xsk_ring_prod__submit(&sock->m_umem->fq, pending_recv(sock->m_xdp_prog));
 	return 0;
@@ -1152,7 +1152,7 @@ static inline int complete_tx_only(xdp_socket_t *sock, int *released)
         int i;
         *released = 1;
         for (i = 0; i < rcvd; ++i)
-            DEBUG_MESSAGE("TX: release: %d\n", idx + i);
+            DEBUG_MESSAGE("TX: release buffer_index: %d\n", idx + i);
 
         xsk_ring_cons__release(&sock->m_umem->cq, rcvd);
         if (sock->m_sock_info->outstanding_tx)
@@ -1256,13 +1256,16 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
                 DEBUG_MESSAGE("TX: Poll had no success\n");
                 snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                          "poll had no success getting sending buffer");
+                errno = EAGAIN;
                 return NULL;
             }
             else if (rc == -1)
             {
+                int err = errno;
                 snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                          "poll for send failed: %s", strerror(errno));
                 DEBUG_MESSAGE("TX: %s\n", sock->m_xdp_prog->m_err);
+                errno = err;
                 return NULL;
             }
             if (complete_tx_only(sock, &released))
@@ -1279,6 +1282,7 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
         if (index == -1)
         {
             DEBUG_MESSAGE("TX: TIMED OUT waiting for packet to be available\n");
+            errno = EAGAIN;
             return NULL;
         }
         DEBUG_MESSAGE("TX: Delay of %ld ns\n", interval);
@@ -1288,14 +1292,17 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
         DEBUG_MESSAGE("TX: Unable to reserve a packet for a full frame\n");
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "Unable to reserve a packet for a full frame size.  Poll?");
+        errno = EAGAIN;
         return NULL;
     }
     sock->m_umem->m_tx_count++;
     buffer = xsk_umem__get_data(sock->m_umem->buffer,
                                 (index + sock->m_umem->m_tx_base) * sock->m_xdp_prog->m_max_frame_size);
     sock->m_umem->m_last_send_buffer = buffer;
-    DEBUG_MESSAGE("TX: Using header: tx_count: %d (header size: %d), last_send_buffer Addr: %p\n",
-                  index, sock->m_reqs->m_rec.m_header_size, buffer);
+    DEBUG_MESSAGE("TX: Using header: tx_count: %d (header size: %d), "
+                  "buffer_index: %d, last_send_buffer Addr: %p\n",
+                  index, sock->m_reqs->m_rec.m_header_size,
+                  index + sock->m_umem->m_tx_base, buffer);
     memcpy(buffer, sock->m_reqs->m_rec.m_header, xdp_send_udp_headroom(sock));
     return (void *)((char *)buffer + xdp_send_udp_headroom(sock));
 }
@@ -1549,7 +1556,7 @@ static int recv_return_raw(xdp_socket_t *sock, void *buffer)
     __u32 idx, idx_fq = 0;
 
     idx = get_index_from_buffer(sock, buffer);
-    DEBUG_MESSAGE("recv_return_raw: Buffer: %p, idx: %d, pending_recv: %d\n",
+    DEBUG_MESSAGE("recv_return_raw: Buffer: %p, buffer_index: %d, pending_recv: %d\n",
                   buffer, idx, sock->m_umem->m_pending_recv);
 	ret = xsk_ring_prod__reserve(&sock->m_umem->fq, 1, &idx_fq);
     DEBUG_MESSAGE("Return into idx_fq: %d\n", idx_fq);
