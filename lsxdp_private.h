@@ -101,6 +101,8 @@ typedef struct xdp_prog_s
     int                     m_num_socks;
     void                   *m_bufs;
     int                     m_max_frame_size;
+    int                     m_shards;
+    int                     m_shard; // 0 for parent or only task.
 } xdp_prog_t;
 
 

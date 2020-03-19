@@ -36,7 +36,20 @@ static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
                                   /* XDP_COPY | // Force copy mode */
                                   /* XDP_ZEROCOPY | // Force zero copy */
                                   0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
-static u32 s_pending_recv = XSK_RING_PROD__DEFAULT_NUM_DESCS / 2;
+
+static u32 pending_recv(xdp_prog_t *prog)
+{
+    if (prog->m_shards)
+        return XSK_RING_PROD__DEFAULT_NUM_DESCS / 2 / prog->m_shards;
+    return XSK_RING_PROD__DEFAULT_NUM_DESCS / 2;
+}
+
+static u32 shard_base(xdp_prog_t *prog)
+{
+    if (prog->m_shards)
+        return (prog->m_shard - 1) * pending_recv(prog);
+    return 0;
+}
 
 void xdp_debug(int on)
 {
@@ -114,8 +127,8 @@ static int xsk_configure_socket(xdp_socket_t *sock)
     sock->m_xdp_prog->m_if[ifindex].m_socket_attached = 1;
 	ret = bpf_get_link_xdp_id(ifindex, &sock->m_progid,
                               opt_xdp_flags);
-    DEBUG_MESSAGE("After xsk_socket__create (ret: %d), xdp_id prog: %d\n", ret,
-                  sock->m_progid);
+    DEBUG_MESSAGE("After xsk_socket__create (ret: %d), xdp_id prog: %d, fd: %d\n",
+                  ret, sock->m_progid, xsk_socket__fd(sock->m_sock_info->xsk));
 	if (ret)
     {
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
@@ -123,22 +136,28 @@ static int xsk_configure_socket(xdp_socket_t *sock)
 		return -1;
     }
 	ret = xsk_ring_prod__reserve(&sock->m_umem->fq,
-                                 s_pending_recv, &idx);
+                                 pending_recv(sock->m_xdp_prog), &idx);
     DEBUG_MESSAGE("Put a lot packets into the fill queue so they can be used "
                   "for recv, starting at index: %d\n", idx);
-	if (ret != s_pending_recv)
+	if (ret != pending_recv(sock->m_xdp_prog))
     {
+        DEBUG_MESSAGE("xsk_ring_prod__reserve: ret: %d != pending_recv: %d\n",
+                      ret, pending_recv(sock->m_xdp_prog));
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "xsk_ring_prod__reserve error %s", strerror(-ret));
 		return -1;
     }
-    sock->m_umem->m_pending_recv = s_pending_recv;
-    sock->m_umem->m_tx_base = s_pending_recv;
-    sock->m_umem->m_tx_max = s_pending_recv;
-	for (i = 0; i < s_pending_recv; i++)
+    sock->m_umem->m_pending_recv = pending_recv(sock->m_xdp_prog);
+    sock->m_umem->m_tx_base = shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog);
+    sock->m_umem->m_tx_max = pending_recv(sock->m_xdp_prog);
+    DEBUG_MESSAGE("pending_recv: %d, tx_base: %d rx buffer_index: %d..%d\n",
+                  sock->m_umem->m_pending_recv, sock->m_umem->m_tx_base,
+                  shard_base(sock->m_xdp_prog),
+                  shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog));
+	for (i = shard_base(sock->m_xdp_prog); i < shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog); i++)
 		*xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx++) =
 			i * sock->m_xdp_prog->m_max_frame_size;
-	xsk_ring_prod__submit(&sock->m_umem->fq, s_pending_recv);
+	xsk_ring_prod__submit(&sock->m_umem->fq, pending_recv(sock->m_xdp_prog));
 	return 0;
 }
 
@@ -1097,7 +1116,7 @@ static int kick_tx(xdp_socket_t *sock)
         {
             DEBUG_MESSAGE("sendto returned %d, errno: %d: %s - setting busy_send\n",
                           ret, orig_errno, strerror(orig_errno));
-            errno = orig_errno;
+            errno = EAGAIN;
             sock->m_busy_send = 1;
             return -1;
         }
@@ -1692,9 +1711,9 @@ int xdp_send_completed(xdp_socket_t *sock, int *still_pending)
     return 0;
 }
 
-int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey)
+int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey, int shard)
 {
-    int value = 0;
+    int value = 0;//socket->m_sock_info->xsk;
     if (socket->m_filter_map == -1)
     {
         socket->m_filter_map = find_map_fd(socket->m_xdp_prog,
@@ -1720,6 +1739,18 @@ int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey)
         return -1;
     }
     return 0;
+}
+
+void xdp_init_shards(xdp_prog_t *prog, int shards)
+
+{
+    prog->m_shards = shards;
+}
+
+void xdp_init_shard(xdp_prog_t *prog, int shard)
+
+{
+    prog->m_shard = shard;
 }
 
 const char *xdp_get_last_error(xdp_prog_t *prog)

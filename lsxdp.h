@@ -227,9 +227,30 @@ void xdp_socket_close(xdp_socket_t *socket);
  * @brief Lets you add an IP to accept from.  All other UDP packets are dropped.
  * @param[in] xdp_socket_t The socket previously created with xdp_prog_init
  * @param[in] ipkey The IP address to accept.
+ * @param[in] shard The shard number this filter is to be processed for.
  * @returns -1 if the filter can't be added.
  **/
-int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey);
+int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey, int shard);
+
+/**
+ * @fn xdp_init_shards
+ * @brief Call from the parent before a fork, the number of children to be
+ *        forked.
+ * @param[in] prog The program structure.
+ * @param[in] shards The number of shards to prepare for.
+ * @returns None.
+ * @warning MUST BE CALLED BEFORE CREATING SOCKETS!
+ **/
+void xdp_init_shards(xdp_prog_t *prog, int shards);
+
+/**
+ * @fn xdp_assign_shard
+ * @brief Call to set the shard number for a subtask.
+ * @param[in] prog The program structure.
+ * @param[in] shard  The shard number (1 based).
+ * @returns None.
+ **/
+void xdp_assign_shard(xdp_prog_t *prog, int shard);
 
 /**
  * @fn xdp_prog_done

@@ -42,7 +42,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     struct iphdr  *iphdr;
     struct udphdr *udphdr;
     struct ip_key ipkey = { 0 };
-    int *ipkey_val = NULL;
+    //int *ipkey_val = NULL;
     int af_xdp = 0;
 	nh.pos = data;
 
@@ -64,7 +64,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     }
     else
     {
-        bpf_printk("sock_prog parse_ethhdr NOT UDP proto: 0x%x\n", bpf_htons(h_proto));
+        //bpf_printk("sock_prog parse_ethhdr NOT UDP proto: 0x%x\n", bpf_htons(h_proto));
         goto out;
     }
   	if (parse_udphdr(&nh, data_end, &udphdr) == -1)
@@ -99,13 +99,16 @@ out:
         bpf_printk("Only IPv4 support so far.  Drop\n");
         return XDP_DROP;
     }
+    /*
 	ipkey_val = bpf_map_lookup_elem(&ip_key_map, &ipkey);
     if (!ipkey_val)
     {
         bpf_printk("Unexpected IP address, drop packet, family: %d, addr: 0x%x\n", ipkey.family, ipkey.v4_addr);
         return XDP_DROP;
     }
-    bpf_printk("Expected ip address, count: %d\n", ++*ipkey_val);
+    bpf_printk("Got expected ip address, index: %d, count: %d\n", ++*ipkey_val);
+    */
+    bpf_printk("UDP, index: %d\n", index);
 
     /* A set entry here means that the correspnding queue_id
      * has an active AF_XDP socket bound to it. */
