@@ -9,7 +9,7 @@
  * If you do not use this mode, libbpf can supply an XDP program for you.
  */
 
-
+//#define USE_PRINTK
 struct bpf_map_def SEC("maps") xsks_map = {
 	.type        = BPF_MAP_TYPE_XSKMAP,
 	.key_size    = sizeof(int),
@@ -46,32 +46,28 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     int af_xdp = 0;
 	nh.pos = data;
 
-    //bpf_printk("sock_prog ENTRY, index: %d\n", index);
 	h_proto = parse_ethhdr(&nh, data_end, &eth);
     if (h_proto == bpf_htons(ETH_P_IP))
     {
    		int ip_type = parse_iphdr(&nh, data_end, &iphdr);
 		if (ip_type != IPPROTO_UDP)
         {
-            //bpf_printk("sock_prog IP NOT UDP: %d\n", ip_type);
 			goto out;
         }
     }
     else if (h_proto == bpf_htons(ETH_P_IPV6))
     {
-        //bpf_printk("sock_prog IPv6\n");
 		goto out;
     }
     else
     {
-        //bpf_printk("sock_prog parse_ethhdr NOT UDP proto: 0x%x\n", bpf_htons(h_proto));
         goto out;
     }
   	if (parse_udphdr(&nh, data_end, &udphdr) == -1)
     {
-        //bpf_printk("sock_prog parse_udphdr failed\n");
         goto out;
     }
+#ifdef USE_PRINTK
     bpf_printk("sock_prog IP source: %u.%u",
                ((unsigned char *)&iphdr->saddr)[0],
                ((unsigned char *)&iphdr->saddr)[1]);
@@ -80,6 +76,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
                ((unsigned char *)&iphdr->saddr)[3]);
     bpf_printk("sock_prog ports: %d %d\n", bpf_htons(udphdr->source),
                bpf_htons(udphdr->dest));
+#endif
     af_xdp = 1;
 out:
 	//rr = (rr + 1) & (MAX_SOCKS - 1);
@@ -96,28 +93,30 @@ out:
     }
     else
     {
+#ifdef USE_PRINTK
         bpf_printk("Only IPv4 support so far.  Drop\n");
+#endif
         return XDP_DROP;
     }
     /*
 	ipkey_val = bpf_map_lookup_elem(&ip_key_map, &ipkey);
     if (!ipkey_val)
     {
-        bpf_printk("Unexpected IP address, drop packet, family: %d, addr: 0x%x\n", ipkey.family, ipkey.v4_addr);
         return XDP_DROP;
     }
-    bpf_printk("Got expected ip address, index: %d, count: %d\n", ++*ipkey_val);
     */
+#ifdef USE_PRINTK
     bpf_printk("UDP, index: %d\n", index);
-
+#endif
     /* A set entry here means that the correspnding queue_id
      * has an active AF_XDP socket bound to it. */
     if (bpf_map_lookup_elem(&xsks_map, &index))
         return bpf_redirect_map(&xsks_map, index, 0);
+#ifdef USE_PRINTK
     bpf_printk("NOT AN AF_XDP SOCKET!\n");
+#endif
 
 no_xdp:
-    //bpf_printk("NOT DOING REDIRECT!\n");
 
     return XDP_PASS;
 }
@@ -173,7 +172,9 @@ static __always_inline int copy_ethhdr(void *dest_end,
     char *cpdest = (char *)dest;
     if (cpdest + sizeof(struct ethhdr_simple) >= (char *)dest_end)
     {
+#ifdef USE_PRINTK
         bpf_printk("copy_ethhdr, dest out of range\n");
+#endif
         return -1;
     }
     dest->dest_addr1 = src->src_addr1;
@@ -193,7 +194,9 @@ static __always_inline int copy_vlan(__u16 proto, void *dest_end,
 
     if (cpdest + sizeof(struct vlan_hdr) * VLAN_MAX_DEPTH >= (char *)dest_end)
     {
+#ifdef USE_PRINTK
         bpf_printk("copy_vlan, dest out of range\n");
+#endif
         return -1;
     }
 	#pragma unroll
@@ -204,7 +207,9 @@ static __always_inline int copy_vlan(__u16 proto, void *dest_end,
 
 		if (dest + 1 >= (struct vlan_hdr *)dest_end)
         {
+#ifdef USE_PRINTK
             bpf_printk("copy_vlan, dest vlan too large, i:%d\n", i);
+#endif
             return -1;
         }
         dest->h_vlan_TCI = src->h_vlan_TCI;
@@ -231,7 +236,9 @@ static __always_inline int copy_ipv6(void *dest_end,
 {
     if (dest + 1 >= (struct ipv6hdr_simple *)dest_end)
     {
+#ifdef USE_PRINTK
         bpf_printk("copy_ipv6, dest out of range\n");
+#endif
         return -1;
     }
     dest->prefix = src->prefix;
@@ -256,7 +263,9 @@ static __always_inline int copy_ipv4(void *dest_end,
 {
     if (dest + 1 >= (struct iphdr_simple *)dest_end)
     {
+#ifdef USE_PRINTK
         bpf_printk("copy_ipv4, dest out of range\n");
+#endif
         return -1;
     }
     dest->prefix1 = src->prefix1;
@@ -308,17 +317,21 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
    		ip_type = parse_iphdr(&nh, data_end, &iphdr);
 		if (ip_type != IPPROTO_TCP && ip_type != IPPROTO_ICMP)
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func IP NOT TCP or ICMP: %d\n", ip_type);
+#endif
 			goto out;
         }
         else
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func IP dest: %u.%u",
                        ((unsigned char *)&iphdr->saddr)[0],
                        ((unsigned char *)&iphdr->saddr)[1]);
             bpf_printk("  .%u.%u\n",
                        ((unsigned char *)&iphdr->saddr)[2],
                        ((unsigned char *)&iphdr->saddr)[3]);
+#endif
         }
     }
     else if (h_proto == bpf_htons(ETH_P_IPV6))
@@ -326,29 +339,34 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
   		ip_type = parse_ip6hdr(&nh, data_end, &ipv6hdr);
 		if (ip_type != IPPROTO_TCP && ip_type != IPPROTO_ICMP)
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func IPv6 NOT TCP or ICMP: %d\n", ip_type);
+#endif
 			goto out;
         }
         else
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func IPv6 addr %x:%x",
                        ipv6hdr->saddr.in6_u.u6_addr32[0],
                        ipv6hdr->saddr.in6_u.u6_addr32[1]);
             bpf_printk(" :%x:%x\n",
                        ipv6hdr->saddr.in6_u.u6_addr32[2],
                        ipv6hdr->saddr.in6_u.u6_addr32[3]);
+#endif
         }
     }
     else
     {
-        bpf_printk("parse_ethhdr failed proto: %d\n", bpf_htons(h_proto));
+#ifdef USE_PRINTK
+        bpf_printk("parse_ethhdr using proto: %d\n", bpf_htons(h_proto));
+#endif
         goto out;
     }
     header_end = nh.pos;
   	//icmp_type = parse_tcphdr(&nh, data_end, &tcphdr);
     //if (icmp_type == -1)
     //{
-    //    bpf_printk("parse_tcphdr failed\n");
     //    goto out;
     //}
     // Copy what we need and fix what we can
@@ -359,30 +377,38 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
 	 */
 	if (!rec)
     {
+#ifdef USE_PRINTK
         bpf_printk("xdp_ping_func map entry not found\n");
+#endif
         goto out;
     }
 	if (!rec->m_addr_set)
     {
+#ifdef USE_PRINTK
         bpf_printk("xdp_ping_func map address not set yet\n");
+#endif
         goto out;
     }
     if ((rec->m_ip4 && h_proto == bpf_htons(ETH_P_IPV6)) ||
         (!rec->m_ip4 && h_proto != bpf_htons(ETH_P_IPV6)))
     {
+#ifdef USE_PRINTK
         bpf_printk("xdp_ping_func map address wrong IP type\n");
+#endif
         goto out;
     }
     if (ipv4)
     {
         if (iphdr->saddr != rec->m_addr.in6_u.u6_addr32[0])
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func map address wrong IP addr %u.%u",
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[0],
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[1]);
             bpf_printk("  .%u.%u\n",
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[2],
                        ((unsigned char *)&rec->m_addr.in6_u.u6_addr32[0])[3]);
+#endif
             goto out;
         }
     }
@@ -393,27 +419,32 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
             ipv6hdr->daddr.in6_u.u6_addr32[2] != rec->m_addr.in6_u.u6_addr32[2] ||
             ipv6hdr->daddr.in6_u.u6_addr32[3] != rec->m_addr.in6_u.u6_addr32[3])
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func map address wrong IPv6 addr %x:%x",
                        rec->m_addr.in6_u.u6_addr32[0],
                        rec->m_addr.in6_u.u6_addr32[1]);
             bpf_printk(" :%x:%x\n",
                        rec->m_addr.in6_u.u6_addr32[2],
                        rec->m_addr.in6_u.u6_addr32[3]);
+#endif
             goto out;
         }
     }
     //if (tcphdr->source != rec->m_port)
     //{
-    //    bpf_printk("xdp_ping_func wrong port %d\n", tcphdr->source);
     //    goto out;
     //}
     rec->m_header_size = (int)(header_end - data);
     map_end = (void *)(rec->m_header + sizeof(rec->m_header));
+#ifdef USE_PRINTK
     bpf_printk("Copy the ethernet header, ip_index: %d\n", ip_index);
+#endif
     if (copy_ethhdr(map_end, (struct ethhdr_simple *)rec->m_header,
                     (struct ethhdr_simple *)eth) == -1)
         goto out;
+#ifdef USE_PRINTK
     bpf_printk("Is vlan: %d, proto: %d\n", proto_is_vlan(eth->h_proto), eth->h_proto);
+#endif
     if (proto_is_vlan(eth->h_proto) &&
         copy_vlan(eth->h_proto, map_end,
                   (struct vlan_hdr *)(rec->m_header + sizeof(struct ethhdr_simple)),
@@ -425,11 +456,15 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
         // This test is done in both places to appease the interpreter
         if (ip_index >= MAX_PACKET_HEADER_SIZE - sizeof(struct ipv6hdr) - sizeof(struct udphdr))
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func ip_index OUT OF RANGE (ipv6): %d\n", ip_index);
+#endif
             goto out;
         }
         map_ipv6hdr = rec->m_header + ip_index;
+#ifdef USE_PRINTK
         bpf_printk("Copy the IPv6 header\n");
+#endif
         if (copy_ipv6(map_end,
                       (struct ipv6hdr_simple *)map_ipv6hdr,
                       (struct ipv6hdr_simple *)ipv6hdr) == -1)
@@ -441,11 +476,15 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
         // This test is done in both places to appease the interpreter
         if (ip_index >= MAX_PACKET_HEADER_SIZE - sizeof(struct ipv6hdr) - sizeof(struct udphdr))
         {
+#ifdef USE_PRINTK
             bpf_printk("xdp_ping_func ip_index OUT OF RANGE (ipv4): %d\n", ip_index);
+#endif
             goto out;
         }
         map_iphdr = rec->m_header + ip_index;
+#ifdef USE_PRINTK
         bpf_printk("Copy the IPv4 header\n");
+#endif
         if (copy_ipv4(map_end,
                       (struct iphdr_simple *)map_iphdr,
                       (struct iphdr_simple *)iphdr) == -1)
@@ -453,7 +492,9 @@ SEC("xdp_ping") int xdp_ping_func(struct xdp_md *ctx)
     }
     rec->m_ip_index = ip_index;
     action = XDP_PASS;
+#ifdef USE_PRINTK
     bpf_printk("xdp_ping_func SUCCESS!!!\n");
+#endif
 out:
 
     return action;
