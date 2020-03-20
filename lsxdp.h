@@ -68,8 +68,32 @@ void xdp_debug(int on);
  *          reported.
  * @note reqs is not freed when the socket is freed so you can reuse it for
  *       another socket call.
+ * @note Forked children who called xdp_socket_parent should call
+ *       xdp_socket_child instead of this call.
  **/
 xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port);
+/**
+ * @fn xdp_socket_parent
+ * @brief Call before forking by the parent
+ * @param[in] prog The return from xdp_prog_init
+ * @param[in] reqs The required information to setup a socket.  Use
+ *                 xdp_get_socket_reqs to obtain this info and leave it
+ *                 allocated through the life of this socket.
+ * @param[in] port The port to use for UDP traffic.
+ * @returns A pointer to xdp_socket_t if successful and NULL if an error can be
+ *          reported.
+ * @note reqs is not freed when the socket is freed so you can reuse it for
+ *       another socket call.
+ **/
+xdp_socket_t *xdp_socket_parent(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
+                                int port);
+/**
+ * @fn xdp_socket_child
+ * @brief Call in the child after forking to complete the socket creation.
+ * @param[in] socket The xdp_socket_t returned from xdp_socket_parent.
+ * @returns 0 if it worked; -1 for an error that needs to be reported.
+ **/
+xdp_socket_t *xdp_socket_child(xdp_socket_t *socket);
 /**
  * @fn xdp_get_socket_reqs
  * @brief Sets up the environment to build a socket.  You must call this once

@@ -103,6 +103,7 @@ typedef struct xdp_prog_s
     int                     m_max_frame_size;
     int                     m_shards;
     int                     m_shard; // 0 for parent or only task.
+    int                     m_child;
 } xdp_prog_t;
 
 

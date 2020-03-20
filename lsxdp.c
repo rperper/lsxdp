@@ -39,6 +39,7 @@ static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
 
 static u32 pending_recv(xdp_prog_t *prog)
 {
+    // A count of the sends or receive range.
     if (prog->m_shards)
         return XSK_RING_PROD__DEFAULT_NUM_DESCS / 2 / prog->m_shards;
     return XSK_RING_PROD__DEFAULT_NUM_DESCS / 2;
@@ -46,8 +47,9 @@ static u32 pending_recv(xdp_prog_t *prog)
 
 static u32 shard_base(xdp_prog_t *prog)
 {
-    if (prog->m_shards)
-        return (prog->m_shard - 1) * pending_recv(prog);
+    // Where to start counting for the range.
+    if (prog->m_shards && prog->m_shard)
+        return (prog->m_shard - 1) * pending_recv(prog) * 2;
     return 0;
 }
 
@@ -88,7 +90,7 @@ static int xsk_configure_umem(void *buffer, xdp_socket_t *sock, u64 size)
 	return 0;
 }
 
-static int xsk_configure_socket(xdp_socket_t *sock)
+static int xsk_configure_socket(xdp_socket_t *sock, int child)
 {
 	struct xsk_socket_config cfg;
 	int ret;
@@ -96,6 +98,7 @@ static int xsk_configure_socket(xdp_socket_t *sock)
     u32 idx;
     int i;
 
+    sock->m_xdp_prog->m_child = child;
 	sock->m_sock_info = calloc(1, sizeof(*sock->m_sock_info));
 	if (!sock->m_sock_info)
     {
@@ -107,7 +110,7 @@ static int xsk_configure_socket(xdp_socket_t *sock)
     sock->m_sock_info->umem = sock->m_umem;
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-	cfg.libbpf_flags = 0;
+	cfg.libbpf_flags = child ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD : 0;
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = opt_xdp_bind_flags;
 	ret = xsk_socket__create(&sock->m_sock_info->xsk,
@@ -154,9 +157,9 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                   sock->m_umem->m_pending_recv, sock->m_umem->m_tx_base,
                   shard_base(sock->m_xdp_prog),
                   shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog));
-	for (i = shard_base(sock->m_xdp_prog); i < shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog); i++)
+	for (i = 0; i < pending_recv(sock->m_xdp_prog); i++)
 		*xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, i/*idx++*/) =
-			i * sock->m_xdp_prog->m_max_frame_size;
+			(i + shard_base(sock->m_xdp_prog)) * sock->m_xdp_prog->m_max_frame_size;
 	xsk_ring_prod__submit(&sock->m_umem->fq, pending_recv(sock->m_xdp_prog));
 	return 0;
 }
@@ -367,7 +370,7 @@ void xdp_socket_close ( xdp_socket_t* socket )
         DEBUG_MESSAGE("free sock_info\n");
         free(socket->m_sock_info);
     }
-    if (socket->m_umem)
+    if (socket->m_umem && !socket->m_xdp_prog->m_child)
     {
         if (socket->m_umem->umem)
         {
@@ -385,6 +388,11 @@ void xdp_socket_close ( xdp_socket_t* socket )
 static void detach_ping(xdp_prog_t *prog, int force_unload)
 {
     int i;
+    if (prog->m_child)
+    {
+        DEBUG_MESSAGE("Child: DO NOT detach_ping\n");
+        return;
+    }
     for (i = 1; i <= prog->m_max_if; ++i)
     {
         if (prog->m_if[i].m_ping_attached || prog->m_if[i].m_socket_attached ||
@@ -461,41 +469,69 @@ static int xsk_load_kern(xdp_socket_t *sock)
     return 0;
 }
 
-xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port)
+static xdp_socket_t *xdp_sock(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
+                              int port, int parent, xdp_socket_t *socket_child)
 {
     xdp_socket_t *socket;
 
-    socket = malloc(sizeof(xdp_socket_t));
-    if (!socket)
+    if (socket_child)
     {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Insufficient memory to allocate socket structure");
-        return NULL;
+        socket = socket_child;
     }
-    memset(socket, 0, sizeof(xdp_socket_t));
-    socket->m_xdp_prog = prog;
-    socket->m_reqs = reqs;
-    socket->m_reqs->m_port = port;
-    socket->m_filter_map = -1;
-    prog->m_num_socks++;
-	if (xsk_configure_umem(prog->m_bufs, socket,
-                           NUM_FRAMES * prog->m_max_frame_size))
+    else
     {
-        xdp_socket_close(socket);
-        return NULL;
+        socket = malloc(sizeof(xdp_socket_t));
+        if (!socket)
+        {
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "Insufficient memory to allocate socket structure");
+            return NULL;
+        }
+        memset(socket, 0, sizeof(xdp_socket_t));
+        socket->m_xdp_prog = prog;
+        socket->m_reqs = reqs;
+        socket->m_reqs->m_port = port;
+        socket->m_filter_map = -1;
+        prog->m_num_socks++;
+        if (xsk_configure_umem(prog->m_bufs, socket,
+                               NUM_FRAMES * prog->m_max_frame_size))
+        {
+            xdp_socket_close(socket);
+            return NULL;
+        }
+        if (xsk_load_kern(socket))
+        {
+            xdp_socket_close(socket);
+            return NULL;
+        }
     }
-    if (xsk_load_kern(socket))
+    if (!parent)
     {
-        xdp_socket_close(socket);
-        return NULL;
-    }
-	if (xsk_configure_socket(socket))
-    {
-        xdp_socket_close(socket);
-        return NULL;
+        if (xsk_configure_socket(socket, socket_child != NULL))
+        {
+            xdp_socket_close(socket);
+            return NULL;
+        }
     }
     prog->m_xsks[prog->m_num_socks - 1] = socket;
     return socket;
+}
+
+xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port)
+{
+    return xdp_sock(prog, reqs, port, 0, 0);
+}
+
+xdp_socket_t *xdp_socket_parent(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
+                                int port)
+{
+    return xdp_sock(prog, reqs, port, 1, 0);
+}
+
+xdp_socket_t *xdp_socket_child(xdp_socket_t *socket)
+{
+    return xdp_sock(socket->m_xdp_prog, socket->m_reqs, socket->m_reqs->m_port,
+                    0, socket);
 }
 
 static int addr_bind_to_ifport(xdp_prog_t *prog,
@@ -1097,6 +1133,8 @@ int xdp_get_poll_fd(xdp_socket_t *sock)
 static int get_index_from_buffer(xdp_socket_t *sock, void *buffer)
 {
     /* Given a buffer location, return the index */
+    DEBUG_MESSAGE("get_index_from_buffer, base: %p, buffer: %p, max_frame: %d\n",
+                  sock->m_umem->buffer, buffer, sock->m_xdp_prog->m_max_frame_size);
     return (int)(((char *)buffer - (char *)sock->m_umem->buffer) / sock->m_xdp_prog->m_max_frame_size);
 }
 
@@ -1152,7 +1190,7 @@ static inline int complete_tx_only(xdp_socket_t *sock, int *released)
         int i;
         *released = 1;
         for (i = 0; i < rcvd; ++i)
-            DEBUG_MESSAGE("TX: release buffer_index: %d\n", idx + i);
+            DEBUG_MESSAGE("TX: release idx: %d\n", idx + i);
 
         xsk_ring_cons__release(&sock->m_umem->cq, rcvd);
         if (sock->m_sock_info->outstanding_tx)
@@ -1236,56 +1274,44 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
     }
     */
     if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
-        index = sock->m_umem->m_tx_count;
+        index = sock->m_umem->m_tx_base + sock->m_umem->m_tx_count;
     else
     {
         int released;
-        struct timespec ts_entry, ts_exit;
-        long interval;
-        DEBUG_MESSAGE("Enter hard loop waiting for packets to be available\n");
-        clock_gettime(CLOCK_REALTIME, &ts_entry);
-        do {
-            int rc;
-            struct pollfd p;
-            memset(&p, 0, sizeof(p));
-            p.fd = xdp_get_poll_fd(sock);
-            p.events = POLLOUT;
-            rc = poll(&p, 1, 100); // 100ms
-            if (rc == 0)
-            {
-                DEBUG_MESSAGE("TX: Poll had no success\n");
-                snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                         "poll had no success getting sending buffer");
-                errno = EAGAIN;
-                return NULL;
-            }
-            else if (rc == -1)
-            {
-                int err = errno;
-                snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                         "poll for send failed: %s", strerror(errno));
-                DEBUG_MESSAGE("TX: %s\n", sock->m_xdp_prog->m_err);
-                errno = err;
-                return NULL;
-            }
-            if (complete_tx_only(sock, &released))
-                return NULL; // Error in buffer
-            if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
-                index = sock->m_umem->m_tx_count;
-            else
-            {
-                clock_gettime(CLOCK_REALTIME, &ts_exit);
-                interval = (ts_exit.tv_sec * 1000000000 + ts_exit.tv_nsec) -
-                           (ts_entry.tv_sec * 1000000000 + ts_entry.tv_nsec);
-            }
-        } while (index == -1 && interval < 1000000000);
-        if (index == -1)
+        int rc;
+        struct pollfd p;
+        DEBUG_MESSAGE("Kick and Poll to see if a packet can be coaxed out\n");
+        if (complete_tx_only(sock, &released))
+            return NULL; // Error in buffer
+        memset(&p, 0, sizeof(p));
+        p.fd = xdp_get_poll_fd(sock);
+        p.events = POLLOUT;
+        rc = poll(&p, 1, 0);
+        if (rc == 0)
         {
-            DEBUG_MESSAGE("TX: TIMED OUT waiting for packet to be available\n");
+            DEBUG_MESSAGE("TX: Poll had no success\n");
+            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "poll had no success getting sending buffer");
             errno = EAGAIN;
             return NULL;
         }
-        DEBUG_MESSAGE("TX: Delay of %ld ns\n", interval);
+        else if (rc == -1)
+        {
+            int err = errno;
+            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                     "poll for send failed: %s", strerror(errno));
+            DEBUG_MESSAGE("TX: %s\n", sock->m_xdp_prog->m_err);
+            errno = err;
+            return NULL;
+        }
+        if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
+            index = sock->m_umem->m_tx_base + sock->m_umem->m_tx_count;
+        if (index == -1)
+        {
+            DEBUG_MESSAGE("TX: Packet not available\n");
+            errno = EAGAIN;
+            return NULL;
+        }
     }
     if (index == -1)
     {
@@ -1299,10 +1325,9 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
     buffer = xsk_umem__get_data(sock->m_umem->buffer,
                                 (index + sock->m_umem->m_tx_base) * sock->m_xdp_prog->m_max_frame_size);
     sock->m_umem->m_last_send_buffer = buffer;
-    DEBUG_MESSAGE("TX: Using header: tx_count: %d (header size: %d), "
-                  "buffer_index: %d, last_send_buffer Addr: %p\n",
-                  index, sock->m_reqs->m_rec.m_header_size,
-                  index + sock->m_umem->m_tx_base, buffer);
+    DEBUG_MESSAGE("TX: Using header: buffer_index: %d (header size: %d), "
+                  "last_send_buffer Addr: %p\n",
+                  index, sock->m_reqs->m_rec.m_header_size, buffer);
     memcpy(buffer, sock->m_reqs->m_rec.m_header, xdp_send_udp_headroom(sock));
     return (void *)((char *)buffer + xdp_send_udp_headroom(sock));
 }
@@ -1754,7 +1779,7 @@ void xdp_init_shards(xdp_prog_t *prog, int shards)
     prog->m_shards = shards;
 }
 
-void xdp_init_shard(xdp_prog_t *prog, int shard)
+void xdp_assign_shard(xdp_prog_t *prog, int shard)
 
 {
     prog->m_shard = shard;
