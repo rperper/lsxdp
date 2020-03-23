@@ -17,22 +17,42 @@
 #include "linux/tcp.h"
 #include "net/if.h"
 #include "sys/ioctl.h"
+#include "sys/mman.h"
+#include "sys/stat.h"
+#include "fcntl.h"
 
 static int s_xdp_debug = 0;
 #define DEBUG_ON    s_xdp_debug
-#define DEBUG_MESSAGE(...) if (s_xdp_debug) fprintf(stderr, __VA_ARGS__)
+int debug_message(const char *format, ...)
+{
+    if (!DEBUG_ON)
+        return 0;
+    struct timeval tv;
+    char buffer[4096];
+    va_list args;
+    struct tm *ptm;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    gettimeofday(&tv, NULL);
+    ptm = localtime(&tv.tv_sec);
+    fprintf(stderr, "%02u:%02u:%02u.%03lu [PID: %d] %s", ptm->tm_hour,
+            ptm->tm_min, ptm->tm_sec, tv.tv_usec / 1000, getpid(), buffer);
+}
+#define DEBUG_MESSAGE debug_message
+//#define DEBUG_MESSAGE(...) if (s_xdp_debug) fprintf(stderr, __VA_ARGS__)
 
 #define TRACE_BUFFER_DEBUG_MESSAGE
 #include "traceBuffer.h"
 
 #define USE_PING
+//#define USE_SHARED_MEM
 
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not set */
                            /*XDP_FLAGS_SKB_MODE | // Generic or emulated (slow)*/
                            /*XDP_FLAGS_DRV_MODE | // Native XDP mode*/
                            /* XDP_FLAGS_HW_MODE |   // Hardware offload*/
                            0;
-static __u16 opt_xdp_bind_flags = /* XDP_SHARED_UMEM | //? */
+static __u16 opt_xdp_bind_flags = /*XDP_SHARED_UMEM |*/ //?
                                   /* XDP_COPY | // Force copy mode */
                                   /* XDP_ZEROCOPY | // Force zero copy */
                                   0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
@@ -58,35 +78,52 @@ void xdp_debug(int on)
     s_xdp_debug = on;
 }
 
-static int xsk_configure_umem(void *buffer, xdp_socket_t *sock, u64 size)
+static int xsk_configure_umem(xdp_prog_t *prog, void *buffer, u64 size)
 {
 	struct xsk_umem_config cfg = {
 		.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
 		.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
-		.frame_size = sock->m_xdp_prog->m_max_frame_size,
+		.frame_size = prog->m_max_frame_size,
 		.frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
 	};
 	int ret;
 
-	sock->m_umem = calloc(1, sizeof(*sock->m_umem));
-	if (!sock->m_umem)
+#if !USE_SHARED_MEM
+	prog->m_umem = calloc(1, sizeof(*prog->m_umem));
+	if (!prog->m_umem)
     {
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "calloc of %ld bytes error: %s", sizeof(*sock->m_umem),
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "calloc of %ld bytes error: %s", sizeof(*prog->m_umem),
                  strerror(errno));
         return -1;
     }
-
-	ret = xsk_umem__create(&sock->m_umem->umem, buffer, size, &sock->m_umem->fq,
-                           &sock->m_umem->cq, &cfg);
-	if (ret)
+#else
+    const char *memfile = "/lsxdp.qs.mem";
+	int memfd = shm_open(memfile, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    if (memfd == -1)
     {
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "xsk_umem__create error %s, size: %llu, max_frame_size: %d",
-                 strerror(-ret), size, sock->m_xdp_prog->m_max_frame_size);
+        int err = errno;
+        DEBUG_MESSAGE("Error opening memory file %s: %s\n", memfile,
+                      strerror(err));
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Error opening memory file: %s: %s", memfile, strerror(err));
         return -1;
     }
-	sock->m_umem->buffer = buffer;
+    prog->m_umem = mmap(NULL, sizeof(*prog->m_umem),
+                        PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+    close(memfd);
+#endif
+	ret = xsk_umem__create(&prog->m_umem->umem, buffer, size, &prog->m_umem->fq,
+                           &prog->m_umem->cq, &cfg);
+	if (ret)
+    {
+        DEBUG_MESSAGE("Error in xsk_umem__create: %s\n", strerror(-ret));
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "xsk_umem__create error %s, size: %llu, max_frame_size: %d",
+                 strerror(-ret), size, prog->m_max_frame_size);
+        return -1;
+    }
+	prog->m_umem->buffer = buffer;
 	return 0;
 }
 
@@ -107,7 +144,7 @@ static int xsk_configure_socket(xdp_socket_t *sock, int child)
                  strerror(errno));
         return -1;
     }
-    sock->m_sock_info->umem = sock->m_umem;
+    //sock->m_xdp_prog->m_umem = sock->m_umem;
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
 	cfg.libbpf_flags = child ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD : 0;
@@ -115,7 +152,7 @@ static int xsk_configure_socket(xdp_socket_t *sock, int child)
 	cfg.bind_flags = opt_xdp_bind_flags;
 	ret = xsk_socket__create(&sock->m_sock_info->xsk,
                              sock->m_xdp_prog->m_if[ifindex].m_ifname,
-                             sock->m_queue, sock->m_umem->umem,
+                             sock->m_queue, sock->m_xdp_prog->m_umem->umem,
                              &sock->m_sock_info->rx, &sock->m_sock_info->tx, &cfg);
 	if (ret)
     {
@@ -138,7 +175,7 @@ static int xsk_configure_socket(xdp_socket_t *sock, int child)
                  "bpf_get_link_xdp_id error %s", strerror(-ret));
 		return -1;
     }
-	ret = xsk_ring_prod__reserve(&sock->m_umem->fq,
+	ret = xsk_ring_prod__reserve(&sock->m_xdp_prog->m_umem->fq,
                                  pending_recv(sock->m_xdp_prog), &idx);
     DEBUG_MESSAGE("Put a lot packets into the fill queue so they can be used "
                   "for recv, starting at index: %d\n", idx);
@@ -150,17 +187,19 @@ static int xsk_configure_socket(xdp_socket_t *sock, int child)
                  "xsk_ring_prod__reserve error %s", strerror(-ret));
 		return -1;
     }
-    sock->m_umem->m_pending_recv = pending_recv(sock->m_xdp_prog);
-    sock->m_umem->m_tx_base = shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog);
-    sock->m_umem->m_tx_max = pending_recv(sock->m_xdp_prog);
+    sock->m_xdp_prog->m_umem->m_pending_recv = pending_recv(sock->m_xdp_prog);
+    sock->m_xdp_prog->m_umem->m_tx_base = shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog);
+    sock->m_xdp_prog->m_umem->m_tx_max = pending_recv(sock->m_xdp_prog);
     DEBUG_MESSAGE("pending_recv: %d, tx_base: %d rx buffer_index: %d..%d\n",
-                  sock->m_umem->m_pending_recv, sock->m_umem->m_tx_base,
+                  sock->m_xdp_prog->m_umem->m_pending_recv,
+                  sock->m_xdp_prog->m_umem->m_tx_base,
                   shard_base(sock->m_xdp_prog),
                   shard_base(sock->m_xdp_prog) + pending_recv(sock->m_xdp_prog));
 	for (i = 0; i < pending_recv(sock->m_xdp_prog); i++)
-		*xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, i/*idx++*/) =
+		*xsk_ring_prod__fill_addr(&sock->m_xdp_prog->m_umem->fq, i/*idx++*/) =
 			(i + shard_base(sock->m_xdp_prog)) * sock->m_xdp_prog->m_max_frame_size;
-	xsk_ring_prod__submit(&sock->m_umem->fq, pending_recv(sock->m_xdp_prog));
+	xsk_ring_prod__submit(&sock->m_xdp_prog->m_umem->fq,
+                          pending_recv(sock->m_xdp_prog));
 	return 0;
 }
 
@@ -342,12 +381,46 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
         xdp_prog_done(prog, 0, 0);
         return NULL;
     }
-	ret = posix_memalign(&prog->m_bufs, getpagesize(), /* PAGE_SIZE aligned */
+#if !USE_SHARED_MEM
+	ret = posix_memalign(&prog->m_bufs, getpagesize(),
 			             NUM_FRAMES * prog->m_max_frame_size);
     if (ret)
     {
         snprintf(prog_init_err, prog_init_err_len,
                  "Insufficient memory allocating big buffer: %s", strerror(errno));
+        xdp_prog_done(prog, 0, 0);
+        return NULL;
+    }
+#else
+    const char *memfile = "/lsxdp.mem";
+	int memfd = shm_open(memfile, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    if (memfd == -1)
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Error opening memory file %s: %s\n", memfile,
+                      strerror(err));
+        snprintf(prog_init_err, prog_init_err_len,
+                 "Error opening memory file: %s: %s", memfile, strerror(err));
+        xdp_prog_done(prog, 0, 0);
+        return NULL;
+    }
+    prog->m_bufs = mmap(NULL, NUM_FRAMES * prog->m_max_frame_size,
+                        PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+    close(memfd);
+    if (!prog->m_bufs)
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Error creating memory: %s\n", strerror(err));
+        snprintf(prog_init_err, prog_init_err_len,
+                 "Error opening memory file: %s: %s", memfile, strerror(err));
+        xdp_prog_done(prog, 0, 0);
+        return NULL;
+    }
+#endif
+    if (xsk_configure_umem(prog, prog->m_bufs,
+                           NUM_FRAMES * prog->m_max_frame_size))
+    {
+        strcpy(prog_init_err, prog->m_err);
         xdp_prog_done(prog, 0, 0);
         return NULL;
     }
@@ -369,16 +442,6 @@ void xdp_socket_close ( xdp_socket_t* socket )
         }
         DEBUG_MESSAGE("free sock_info\n");
         free(socket->m_sock_info);
-    }
-    if (socket->m_umem && !socket->m_xdp_prog->m_child)
-    {
-        if (socket->m_umem->umem)
-        {
-            DEBUG_MESSAGE("Doing xdk_umem__delete\n");
-            xsk_umem__delete(socket->m_umem->umem); //
-        }
-        DEBUG_MESSAGE("Doing free of umem\n");
-        free(socket->m_umem);
     }
     DEBUG_MESSAGE("freeing socket\n");
     socket->m_xdp_prog->m_num_socks--;
@@ -493,12 +556,6 @@ static xdp_socket_t *xdp_sock(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
         socket->m_reqs->m_port = port;
         socket->m_filter_map = -1;
         prog->m_num_socks++;
-        if (xsk_configure_umem(prog->m_bufs, socket,
-                               NUM_FRAMES * prog->m_max_frame_size))
-        {
-            xdp_socket_close(socket);
-            return NULL;
-        }
         if (xsk_load_kern(socket))
         {
             xdp_socket_close(socket);
@@ -1120,8 +1177,26 @@ void xdp_prog_done ( xdp_prog_t* prog, int unload, int force_unload )
         detach_ping(prog, 1/*force_unload*/);
     if (prog->m_num_socks)
         fprintf(stderr, "%d Sockets remain open!\n", prog->m_num_socks);
+    if (!prog->m_umem)
+    {
+        if (prog->m_umem->umem)
+        {
+            DEBUG_MESSAGE("Doing xdk_umem__delete\n");
+            xsk_umem__delete(prog->m_umem->umem); //
+        }
+        DEBUG_MESSAGE("Doing free of umem\n");
+#if !USE_SHARED_MEM
+        free(prog->m_umem);
+#else
+        munmap(prog->m_umem, sizeof(*prog->m_umem));
+#endif
+    }
     if (prog->m_bufs)
+#if !USE_SHARED_MEM
         free(prog->m_bufs);
+#else
+        munmap(prog->m_bufs, NUM_FRAMES * prog->m_max_frame_size);
+#endif
     free(prog);
 }
 
@@ -1134,8 +1209,8 @@ static int get_index_from_buffer(xdp_socket_t *sock, void *buffer)
 {
     /* Given a buffer location, return the index */
     DEBUG_MESSAGE("get_index_from_buffer, base: %p, buffer: %p, max_frame: %d\n",
-                  sock->m_umem->buffer, buffer, sock->m_xdp_prog->m_max_frame_size);
-    return (int)(((char *)buffer - (char *)sock->m_umem->buffer) / sock->m_xdp_prog->m_max_frame_size);
+                  sock->m_xdp_prog->m_umem->buffer, buffer, sock->m_xdp_prog->m_max_frame_size);
+    return (int)(((char *)buffer - (char *)sock->m_xdp_prog->m_umem->buffer) / sock->m_xdp_prog->m_max_frame_size);
 }
 
 static int kick_tx(xdp_socket_t *sock)
@@ -1184,7 +1259,7 @@ static inline int complete_tx_only(xdp_socket_t *sock, int *released)
         return -1;
     if (was_busy_send)
         return 0;
-    rcvd = xsk_ring_cons__peek(&sock->m_umem->cq, 64, &idx);
+    rcvd = xsk_ring_cons__peek(&sock->m_xdp_prog->m_umem->cq, 64, &idx);
     if (rcvd > 0)
     {
         int i;
@@ -1192,7 +1267,7 @@ static inline int complete_tx_only(xdp_socket_t *sock, int *released)
         for (i = 0; i < rcvd; ++i)
             DEBUG_MESSAGE("TX: release idx: %d\n", idx + i);
 
-        xsk_ring_cons__release(&sock->m_umem->cq, rcvd);
+        xsk_ring_cons__release(&sock->m_xdp_prog->m_umem->cq, rcvd);
         if (sock->m_sock_info->outstanding_tx)
         {
             if (sock->m_sock_info->outstanding_tx >= rcvd)
@@ -1203,15 +1278,15 @@ static inline int complete_tx_only(xdp_socket_t *sock, int *released)
                 DEBUG_MESSAGE("TX: Completion queue forced to zero (would go lower)\n");
             }
         }
-        if (sock->m_umem->m_tx_count >= rcvd)
+        if (sock->m_xdp_prog->m_umem->m_tx_count >= rcvd)
         {
-            sock->m_umem->m_tx_count -= rcvd;
-            DEBUG_MESSAGE("TX: New tx_count: %d\n", sock->m_umem->m_tx_count);
+            sock->m_xdp_prog->m_umem->m_tx_count -= rcvd;
+            DEBUG_MESSAGE("TX: New tx_count: %d\n", sock->m_xdp_prog->m_umem->m_tx_count);
         }
         else
         {
             DEBUG_MESSAGE("TX: tx_count now forced to 0\n");
-            sock->m_umem->m_tx_count = 0;
+            sock->m_xdp_prog->m_umem->m_tx_count = 0;
         }
         DEBUG_MESSAGE("TX: Completion queue has %d, idx: %d, outstanding: %d\n",
                       rcvd, idx, sock->m_sock_info->outstanding_tx);
@@ -1273,8 +1348,8 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
             DEBUG_MESSAGE("UNEXPECTED RECEIVED EVENT: %d\n", p.revents);
     }
     */
-    if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
-        index = sock->m_umem->m_tx_base + sock->m_umem->m_tx_count;
+    if (sock->m_xdp_prog->m_umem->m_tx_count < sock->m_xdp_prog->m_umem->m_tx_max)
+        index = sock->m_xdp_prog->m_umem->m_tx_base + sock->m_xdp_prog->m_umem->m_tx_count;
     else
     {
         int released;
@@ -1304,8 +1379,8 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
             errno = err;
             return NULL;
         }
-        if (sock->m_umem->m_tx_count < sock->m_umem->m_tx_max)
-            index = sock->m_umem->m_tx_base + sock->m_umem->m_tx_count;
+        if (sock->m_xdp_prog->m_umem->m_tx_count < sock->m_xdp_prog->m_umem->m_tx_max)
+            index = sock->m_xdp_prog->m_umem->m_tx_base + sock->m_xdp_prog->m_umem->m_tx_count;
         if (index == -1)
         {
             DEBUG_MESSAGE("TX: Packet not available\n");
@@ -1321,10 +1396,10 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
         errno = EAGAIN;
         return NULL;
     }
-    sock->m_umem->m_tx_count++;
-    buffer = xsk_umem__get_data(sock->m_umem->buffer,
-                                (index + sock->m_umem->m_tx_base) * sock->m_xdp_prog->m_max_frame_size);
-    sock->m_umem->m_last_send_buffer = buffer;
+    sock->m_xdp_prog->m_umem->m_tx_count++;
+    buffer = xsk_umem__get_data(sock->m_xdp_prog->m_umem->buffer,
+                                (index + sock->m_xdp_prog->m_umem->m_tx_base) * sock->m_xdp_prog->m_max_frame_size);
+    sock->m_xdp_prog->m_umem->m_last_send_buffer = buffer;
     DEBUG_MESSAGE("TX: Using header: buffer_index: %d (header size: %d), "
                   "last_send_buffer Addr: %p\n",
                   index, sock->m_reqs->m_rec.m_header_size, buffer);
@@ -1332,31 +1407,14 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
     return (void *)((char *)buffer + xdp_send_udp_headroom(sock));
 }
 
-int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
-                struct sockaddr *addr)
+static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
+                     struct sockaddr *addr)
 {
     int ip_index;
     struct udphdr *udphdr;
     char *buffer_char = buffer;
     __u16 port = sock->m_reqs->m_port;
     int headroom = xdp_send_udp_headroom(sock);
-    if ((buffer_char >= (char *)sock->m_umem->buffer) &&
-        (buffer_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES))
-    {
-        DEBUG_MESSAGE("TX: Buffer in range - assume it was gotten correctly\n");
-    }
-    else
-    {
-        DEBUG_MESSAGE("TX: Require that the packet be aquired with get_send_buffer\n");
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Require that the packet be acquired with a xdp_get_send_buffer()"
-                 " or a call to xdp_send() - %p not in range %p..%p (test 1: %d, test 2: %d)",
-                 buffer_char, sock->m_umem->buffer,
-                 sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES,
-                 buffer_char >= (char *)sock->m_umem->buffer,
-                 buffer_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES);
-        return -1;
-    }
     ip_index = sock->m_reqs->m_rec.m_ip_index;
     if (sock->m_reqs->m_rec.m_ip4)
     {
@@ -1399,8 +1457,8 @@ int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
     return tx_only(sock, buffer, len + headroom, last);
 }
 
-int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
-             struct sockaddr *addr)
+static int x_send(xdp_socket_t *sock, void *data, int len, int last,
+                  struct sockaddr *addr, int must_zero_copy)
 {
     int headroom = xdp_send_udp_headroom(sock);
     char *send_buffer;
@@ -1411,18 +1469,18 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
     {
         int rc;
         send_buffer = data - headroom;
-        if (!sock->m_umem->m_last_send_buffer)
+        if (!sock->m_xdp_prog->m_umem->m_last_send_buffer)
         {
             DEBUG_MESSAGE("TX: in busy send in xdp_send, just retry for now\n");
             return complete_tx_only(sock, &released);
         }
         DEBUG_MESSAGE("TX: in busy send in xdp_send, but a pending buffer %p"
-                      ", current buffer: %p\n", sock->m_umem->m_last_send_buffer,
+                      ", current buffer: %p\n", sock->m_xdp_prog->m_umem->m_last_send_buffer,
                       send_buffer);
         rc = complete_tx_only(sock, &released);
         if (rc)
             return rc;
-        if (send_buffer == sock->m_umem->m_last_send_buffer)
+        if (send_buffer == sock->m_xdp_prog->m_umem->m_last_send_buffer)
         {
             DEBUG_MESSAGE("TX: busy send but NEW DATA to send!\n");
         }
@@ -1432,7 +1490,7 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
             return 0;
         }
     }
-    sock->m_umem->m_last_send_buffer = NULL;
+    sock->m_xdp_prog->m_umem->m_last_send_buffer = NULL;
     if (!sock->m_reqs->m_sendable)
     {
         DEBUG_MESSAGE("TX: socket can't be used for sending\n");
@@ -1441,11 +1499,23 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
                  " as documented");
         return -1;
     }
-    if (data_char > (char *)sock->m_umem->buffer &&
-        data_char < (char *)sock->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES)
+    if (data_char > (char *)sock->m_xdp_prog->m_umem->buffer &&
+        data_char < (char *)sock->m_xdp_prog->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES)
     {
         DEBUG_MESSAGE("TX: Data in buffer range - assume it was gotten correctly\n");
         send_buffer = data_char - headroom;
+    }
+    else if (must_zero_copy)
+    {
+        DEBUG_MESSAGE("TX: Require that the packet be aquired with get_send_buffer\n");
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Require that the packet be acquired with a xdp_get_send_buffer()"
+                 " or a call to xdp_send() - %p not in range %p..%p (test 1: %d, test 2: %d)",
+                 data_char, sock->m_xdp_prog->m_umem->buffer,
+                 sock->m_xdp_prog->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES,
+                 data_char >= (char *)sock->m_xdp_prog->m_umem->buffer,
+                 data_char < (char *)sock->m_xdp_prog->m_umem->buffer + sock->m_xdp_prog->m_max_frame_size * NUM_FRAMES);
+        return -1;
     }
     else
     {
@@ -1455,7 +1525,19 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
             return -1;
         memcpy(send_buffer + headroom, data, len);
     }
-    return xdp_send_zc(sock, send_buffer, len, last, addr);
+    return x_send_zc(sock, send_buffer, len, last, addr);
+}
+
+int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
+             struct sockaddr *addr)
+{
+    return x_send(sock, data, len, last, addr, 0);
+}
+
+int xdp_send_zc(xdp_socket_t *sock, void *data, int len, int last,
+                struct sockaddr *addr)
+{
+    return x_send(sock, data, len, last, addr, 1);
 }
 
 int xdp_send_udp_headroom(xdp_socket_t *sock)
@@ -1582,8 +1664,8 @@ static int recv_return_raw(xdp_socket_t *sock, void *buffer)
 
     idx = get_index_from_buffer(sock, buffer);
     DEBUG_MESSAGE("recv_return_raw: Buffer: %p, buffer_index: %d, pending_recv: %d\n",
-                  buffer, idx, sock->m_umem->m_pending_recv);
-	ret = xsk_ring_prod__reserve(&sock->m_umem->fq, 1, &idx_fq);
+                  buffer, idx, sock->m_xdp_prog->m_umem->m_pending_recv);
+	ret = xsk_ring_prod__reserve(&sock->m_xdp_prog->m_umem->fq, 1, &idx_fq);
     DEBUG_MESSAGE("Return into idx_fq: %d\n", idx_fq);
 	if (ret != 1)
     {
@@ -1591,10 +1673,10 @@ static int recv_return_raw(xdp_socket_t *sock, void *buffer)
                  "recv_return_raw error returning %p (%d)", buffer, ret);
 		return -1;
     }
-    sock->m_umem->m_pending_recv++;
-    *xsk_ring_prod__fill_addr(&sock->m_sock_info->umem->fq, idx_fq) =
+    sock->m_xdp_prog->m_umem->m_pending_recv++;
+    *xsk_ring_prod__fill_addr(&sock->m_xdp_prog->m_umem->fq, idx_fq) =
 			idx * sock->m_xdp_prog->m_max_frame_size;
-	xsk_ring_prod__submit(&sock->m_umem->fq, 1);
+	xsk_ring_prod__submit(&sock->m_xdp_prog->m_umem->fq, 1);
 	sock->m_sock_info->rx_npkts += 1;
     return 0;
 }
@@ -1668,16 +1750,17 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
     {
         u64 addr = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx)->addr;
         u32 len = xsk_ring_cons__rx_desc(&sock->m_sock_info->rx, idx_rx)->len;
-        char *pkt = xsk_umem__get_data(sock->m_sock_info->umem->buffer, addr);
+        char *pkt = xsk_umem__get_data(sock->m_xdp_prog->m_umem->buffer, addr);
         xsk_ring_cons__release(&sock->m_sock_info->rx, rcvd);
         int res;
         int header_pos = 0;
 
         was_recv = 1;
-        sock->m_umem->m_pending_recv--;
+        sock->m_xdp_prog->m_umem->m_pending_recv--;
         DEBUG_MESSAGE("Recv raw packet: Addr: %p, pending_recv: %d, idx_rx: %d no_effect: %d\n",
-                      pkt, sock->m_umem->m_pending_recv, idx_rx, sock->m_umem->m_recv_no_effect);
-        sock->m_umem->m_recv_no_effect = 0;
+                      pkt, sock->m_xdp_prog->m_umem->m_pending_recv, idx_rx,
+                      sock->m_xdp_prog->m_umem->m_recv_no_effect);
+        sock->m_xdp_prog->m_umem->m_recv_no_effect = 0;
         traceBuffer(pkt, len);
         res = parse_recv_ip_hdr(sock, pkt, len, &header_pos, sockaddr, addrlen);
         if (res)
@@ -1702,20 +1785,20 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
         return 1; // Something received.
     }
     if (!was_recv)
-        sock->m_umem->m_recv_no_effect++;
+        sock->m_xdp_prog->m_umem->m_recv_no_effect++;
     return 0;
 }
 
 int xdp_recv_return(xdp_socket_t *sock, void *data)
 {
     void *buffer;
-	if (data < sock->m_umem->buffer ||
-        data >= sock->m_umem->buffer + sock->m_umem->m_tx_base * sock->m_xdp_prog->m_max_frame_size)
+	if (data < sock->m_xdp_prog->m_umem->buffer ||
+        data >= sock->m_xdp_prog->m_umem->buffer + sock->m_xdp_prog->m_umem->m_tx_base * sock->m_xdp_prog->m_max_frame_size)
     {
         DEBUG_MESSAGE("xdp_recv_return invalid buffer\n");
         snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                  "xdp_recv_return invalid buffer (data: %p, buffer: %p)",
-                 data, sock->m_umem->buffer);
+                 data, sock->m_xdp_prog->m_umem->buffer);
         return -1;
     }
     buffer = (void *)(((__u64)data / sock->m_xdp_prog->m_max_frame_size) *

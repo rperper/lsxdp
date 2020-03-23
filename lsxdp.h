@@ -189,8 +189,8 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
  * NAT devices.
  * @returns -1 for an error or 0 for success.
  **/
-//int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
-//                struct sockaddr *addr);
+int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
+                struct sockaddr *addr);
 
 /**
  * @fn xdp_send_completed

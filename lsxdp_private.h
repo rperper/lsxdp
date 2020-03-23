@@ -44,7 +44,6 @@ struct xsk_umem_info {
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
-	struct xsk_umem_info *umem;
 	struct xsk_socket *xsk;
 	unsigned long rx_npkts;
 	unsigned long tx_npkts;
@@ -66,7 +65,6 @@ typedef struct lsxdp_socket_reqs_s
 typedef  struct xdp_socket_s
 {
     struct xdp_prog_s      *m_xdp_prog;
-    struct xsk_umem_info   *m_umem;
     struct xsk_socket_info *m_sock_info;
     lsxdp_socket_reqs_t    *m_reqs;
     int                     m_queue;
@@ -94,6 +92,7 @@ typedef struct xdp_if_s
 
 typedef struct xdp_prog_s
 {
+    struct xsk_umem_info   *m_umem;
     char                    m_err[LSXDP_PRIVATE_MAX_ERR_LEN];
     int                     m_max_if;
     xdp_if_t                m_if[MAX_IF]; // ifindex is the index to this array - numbers start at 1 so 0 is meaningless
