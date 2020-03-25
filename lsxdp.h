@@ -64,6 +64,7 @@ void xdp_debug(int on);
  *                 xdp_get_socket_reqs to obtain this info and leave it
  *                 allocated through the life of this socket.
  * @param[in] port The port to use for UDP traffic.
+ * @param[in] send_only Whether this is a send only socket or a send/recv socket.
  * @returns A pointer to xdp_socket_t if successful and NULL if an error can be
  *          reported.
  * @note reqs is not freed when the socket is freed so you can reuse it for
@@ -71,7 +72,8 @@ void xdp_debug(int on);
  * @note Forked children who called xdp_socket_parent should call
  *       xdp_socket_child instead of this call.
  **/
-xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port);
+xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port,
+                         int send_only);
 /**
  * @fn xdp_socket_parent
  * @brief Call before forking by the parent
@@ -80,13 +82,14 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port);
  *                 xdp_get_socket_reqs to obtain this info and leave it
  *                 allocated through the life of this socket.
  * @param[in] port The port to use for UDP traffic.
+ * @param[in] send_only Whether this is a send only socket or a send/recv socket.
  * @returns A pointer to xdp_socket_t if successful and NULL if an error can be
  *          reported.
  * @note reqs is not freed when the socket is freed so you can reuse it for
  *       another socket call.
  **/
 xdp_socket_t *xdp_socket_parent(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
-                                int port);
+                                int port, int send_only);
 /**
  * @fn xdp_socket_child
  * @brief Call in the child after forking to complete the socket creation.
@@ -275,6 +278,16 @@ void xdp_init_shards(xdp_prog_t *prog, int shards);
  * @returns None.
  **/
 void xdp_assign_shard(xdp_prog_t *prog, int shard);
+
+/**
+ * @fn xdp_set_sendable
+ * @brief Given an IP address and a situation where you can't receive or send
+ *        a ping, do the ioctl work to prebuild the header for send.
+ * @param[in] sock The socket structure.
+ * @param[in] addr The address to build the header for.
+ * @returns -1 for a reportable error, 0 if it worked.
+ **/
+int xdp_set_sendable(xdp_socket_t *sock, struct sockaddr *addr);
 
 /**
  * @fn xdp_prog_done

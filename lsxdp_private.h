@@ -74,6 +74,7 @@ typedef  struct xdp_socket_s
     int                     m_last_tx_frame_size;
     int                     m_busy_send;
     int                     m_filter_map;
+    int                     m_send_only;
 } xdp_socket_t;
 
 typedef struct xdp_if_s
