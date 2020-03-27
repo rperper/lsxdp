@@ -268,7 +268,7 @@ int main(int argc, char **argv)
                 printf("Press [ENTER] to continue... ->");
                 fgets(input, sizeof(input), stdin);
             }
-            sock = xdp_socket(prog, reqs, htons(atoi(port)));
+            sock = xdp_socket(prog, reqs, htons(atoi(port)), 0, 0);
             if (!sock)
             {
                 ret = -1;

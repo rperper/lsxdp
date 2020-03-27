@@ -46,7 +46,7 @@ int debug_message(const char *format, ...)
 #include "traceBuffer.h"
 
 #define USE_PING
-//#define USE_SHARED_MEM
+#define USE_SHARED_MEM
 
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not set */
                            /*XDP_FLAGS_SKB_MODE | // Generic or emulated (slow)*/
@@ -89,8 +89,12 @@ static int xsk_configure_umem(xdp_prog_t *prog, void *buffer, u64 size)
 	};
 	int ret;
 
-#if !USE_SHARED_MEM
+#ifndef USE_SHARED_MEM
 	prog->m_umem = calloc(1, sizeof(*prog->m_umem));
+#else
+    prog->m_umem = mmap(NULL, sizeof(*prog->m_umem),
+                        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+#endif
 	if (!prog->m_umem)
     {
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
@@ -98,22 +102,6 @@ static int xsk_configure_umem(xdp_prog_t *prog, void *buffer, u64 size)
                  strerror(errno));
         return -1;
     }
-#else
-    const char *memfile = "/lsxdp.qs.mem";
-	int memfd = shm_open(memfile, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    if (memfd == -1)
-    {
-        int err = errno;
-        DEBUG_MESSAGE("Error opening memory file %s: %s\n", memfile,
-                      strerror(err));
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Error opening memory file: %s: %s", memfile, strerror(err));
-        return -1;
-    }
-    prog->m_umem = mmap(NULL, sizeof(*prog->m_umem),
-                        PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-    close(memfd);
-#endif
 	ret = xsk_umem__create(&prog->m_umem->umem, buffer, size, &prog->m_umem->fq,
                            &prog->m_umem->cq, &cfg);
 	if (ret)
@@ -146,11 +134,15 @@ static int xsk_configure_socket(xdp_socket_t *sock, int child, int send_only)
         return -1;
     }
     //sock->m_xdp_prog->m_umem = sock->m_umem;
-	cfg.rx_size = send_only ? 0 : XSK_RING_CONS__DEFAULT_NUM_DESCS;
-	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+	cfg.rx_size = send_only ? 0 : (pending_recv(sock->m_xdp_prog) * 2);
+	cfg.tx_size = pending_recv(sock->m_xdp_prog) * 2;
 	cfg.libbpf_flags = child ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD : 0;
 	cfg.xdp_flags = opt_xdp_flags;
-	cfg.bind_flags = opt_xdp_bind_flags;
+	cfg.bind_flags = opt_xdp_bind_flags/* | child ? XDP_SHARED_UMEM : 0*/;
+    DEBUG_MESSAGE("xsk_socket__create queue: %d, send_only: %d, libbpf_flags: "
+                  "0x%x, xdp_flags: 0x%x, bind_flags: 0x%x\n",
+                  sock->m_queue, sock->m_send_only, cfg.libbpf_flags,
+                  cfg.xdp_flags, cfg.bind_flags);
 	ret = xsk_socket__create(&sock->m_sock_info->xsk,
                              sock->m_xdp_prog->m_if[ifindex].m_ifname,
                              sock->m_queue, sock->m_xdp_prog->m_umem->umem,
@@ -396,7 +388,7 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
         xdp_prog_done(prog, 0, 0);
         return NULL;
     }
-#if !USE_SHARED_MEM
+#ifndef USE_SHARED_MEM
 	ret = posix_memalign(&prog->m_bufs, getpagesize(),
 			             NUM_FRAMES * prog->m_max_frame_size);
     if (ret)
@@ -407,27 +399,14 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
         return NULL;
     }
 #else
-    const char *memfile = "/lsxdp.mem";
-	int memfd = shm_open(memfile, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    if (memfd == -1)
-    {
-        int err = errno;
-        DEBUG_MESSAGE("Error opening memory file %s: %s\n", memfile,
-                      strerror(err));
-        snprintf(prog_init_err, prog_init_err_len,
-                 "Error opening memory file: %s: %s", memfile, strerror(err));
-        xdp_prog_done(prog, 0, 0);
-        return NULL;
-    }
     prog->m_bufs = mmap(NULL, NUM_FRAMES * prog->m_max_frame_size,
-                        PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-    close(memfd);
+                        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1 /*memfd*/, 0);
     if (!prog->m_bufs)
     {
         int err = errno;
         DEBUG_MESSAGE("Error creating memory: %s\n", strerror(err));
         snprintf(prog_init_err, prog_init_err_len,
-                 "Error opening memory file: %s: %s", memfile, strerror(err));
+                 "Error creating memory: %s", strerror(err));
         xdp_prog_done(prog, 0, 0);
         return NULL;
     }
@@ -549,7 +528,7 @@ static int xsk_load_kern(xdp_socket_t *sock)
 
 static xdp_socket_t *xdp_sock(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
                               int port, int parent, xdp_socket_t *socket_child,
-                              int send_only)
+                              int send_only, int queue)
 {
     xdp_socket_t *socket;
 
@@ -581,6 +560,7 @@ static xdp_socket_t *xdp_sock(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
     }
     if (!parent)
     {
+        socket->m_queue = queue;
         if (xsk_configure_socket(socket, socket_child != NULL, send_only))
         {
             xdp_socket_close(socket);
@@ -592,21 +572,21 @@ static xdp_socket_t *xdp_sock(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
 }
 
 xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port,
-                         int send_only)
+                         int send_only, int queue)
 {
-    return xdp_sock(prog, reqs, port, 0, 0, send_only);
+    return xdp_sock(prog, reqs, port, 0, 0, send_only, queue);
 }
 
 xdp_socket_t *xdp_socket_parent(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
                                 int port, int send_only)
 {
-    return xdp_sock(prog, reqs, port, 1, 0, send_only);
+    return xdp_sock(prog, reqs, port, 1, 0, send_only, 0);
 }
 
-xdp_socket_t *xdp_socket_child(xdp_socket_t *socket)
+xdp_socket_t *xdp_socket_child(xdp_socket_t *socket, int queue)
 {
     return xdp_sock(socket->m_xdp_prog, socket->m_reqs, socket->m_reqs->m_port,
-                    0, socket, socket->m_send_only);
+                    0, socket, socket->m_send_only, queue);
 }
 
 static int addr_bind_to_ifport(xdp_prog_t *prog,
@@ -1202,14 +1182,14 @@ void xdp_prog_done ( xdp_prog_t* prog, int unload, int force_unload )
             xsk_umem__delete(prog->m_umem->umem); //
         }
         DEBUG_MESSAGE("Doing free of umem\n");
-#if !USE_SHARED_MEM
+#ifndef USE_SHARED_MEM
         free(prog->m_umem);
 #else
         munmap(prog->m_umem, sizeof(*prog->m_umem));
 #endif
     }
     if (prog->m_bufs)
-#if !USE_SHARED_MEM
+#ifndef USE_SHARED_MEM
         free(prog->m_bufs);
 #else
         munmap(prog->m_bufs, NUM_FRAMES * prog->m_max_frame_size);
