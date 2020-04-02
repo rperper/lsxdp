@@ -28,6 +28,10 @@ extern "C" {
 typedef __u64 u64;
 typedef __u32 u32;
 
+#define MAX_QUEUES 10
+
+/* One of these xsk_umem_info structures per queue */
+/* See m_umem below and the queue number is the index into this array.  */
 struct xsk_umem_info {
 	struct xsk_ring_prod fq;
 	struct xsk_ring_cons cq;
@@ -39,6 +43,7 @@ struct xsk_umem_info {
     int   m_pending_recv;
     void *m_last_send_buffer;
     int   m_recv_no_effect;
+    void *m_bufs;
 };
 
 struct xsk_socket_info {
@@ -56,10 +61,12 @@ struct xdp_prog_s;
 
 typedef struct lsxdp_socket_reqs_s
 {
-    int               m_ifindex;
-    __u16             m_port;
-    int               m_sendable;
-    struct packet_rec m_rec;
+    int                 m_ifindex;
+    __u16               m_port;
+    int                 m_sendable;
+    char                m_mac[MAC_LEN];
+    struct sockaddr_in  m_sa_in;
+    struct packet_rec   m_rec;
 } lsxdp_socket_reqs_t;
 
 typedef  struct xdp_socket_s
@@ -75,6 +82,7 @@ typedef  struct xdp_socket_s
     int                     m_busy_send;
     int                     m_filter_map;
     int                     m_send_only;
+    __u16                   m_in_port;
 } xdp_socket_t;
 
 typedef struct xdp_if_s
@@ -93,13 +101,13 @@ typedef struct xdp_if_s
 
 typedef struct xdp_prog_s
 {
-    struct xsk_umem_info   *m_umem;
+    int                     m_queues;
+    struct xsk_umem_info    m_umem[MAX_QUEUES];
     char                    m_err[LSXDP_PRIVATE_MAX_ERR_LEN];
     int                     m_max_if;
     xdp_if_t                m_if[MAX_IF]; // ifindex is the index to this array - numbers start at 1 so 0 is meaningless
     xdp_socket_t           *m_xsks[MAX_SOCKS];
     int                     m_num_socks;
-    void                   *m_bufs;
     int                     m_max_frame_size;
     int                     m_shards;
     int                     m_shard; // 0 for parent or only task.
