@@ -4,6 +4,7 @@ cmake_minimum_required(VERSION 2.8)
 SET(lsxdp_STAT_SRCS
     lsxdp.c
     bpf_xdp.c
+    ip2mac.c
 )
 
 add_custom_target(xdp_sock_kern ALL

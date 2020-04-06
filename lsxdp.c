@@ -5,6 +5,7 @@
 #include "ifaddrs.h"
 #include "libbpf/src/bpf.h"
 #include "poll.h"
+#include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <time.h>
@@ -21,6 +22,8 @@
 #include "sys/mman.h"
 #include "sys/stat.h"
 #include "fcntl.h"
+
+#include "ip2mac.h"
 
 static int s_xdp_debug = 0;
 #define DEBUG_ON    s_xdp_debug
@@ -86,6 +89,11 @@ static u32 shard_base(xdp_prog_t *prog)
 void xdp_debug(int on)
 {
     s_xdp_debug = on;
+}
+
+int xdp_get_debug(void)
+{
+    return s_xdp_debug;
 }
 
 static int xsk_configure_umem(xdp_prog_t *prog, int queue, u64 size)
@@ -427,6 +435,14 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
     {
         snprintf(prog_init_err, prog_init_err_len,
                  "Invalid max frame size must be <= %d", LSXDP_MAX_FRAME_SIZE);
+        xdp_prog_done(prog, 0, 0);
+        return NULL;
+    }
+    prog->m_ip2mac_fd = ip2mac_init(100);
+    if (prog->m_ip2mac_fd < 0)
+    {
+        snprintf(prog_init_err, prog_init_err_len,
+                 "Error creating IP to Mac table: %s", strerror(errno));
         xdp_prog_done(prog, 0, 0);
         return NULL;
     }
@@ -1178,6 +1194,8 @@ void xdp_prog_done ( xdp_prog_t* prog, int unload, int force_unload )
 {
     if (!prog)
         return;
+    if (prog->m_ip2mac_fd > 0)
+        ip2mac_done(prog->m_ip2mac_fd);
     if (unload)
         detach_ping(prog, 1/*force_unload*/);
     if (prog->m_num_socks)
@@ -1238,23 +1256,27 @@ static int kick_tx(xdp_socket_t *sock)
     {
         if (ret != 0)
         {
-            DEBUG_MESSAGE("sendto returned %d, errno: %d: %s - setting busy_send\n",
-                          ret, orig_errno, strerror(orig_errno));
+            DEBUG_MESSAGE("sendto returned %d, errno: %d: %s - setting busy_send sock: %p\n",
+                          ret, orig_errno, strerror(orig_errno), sock);
             errno = EAGAIN;
             sock->m_busy_send = 1;
             return -1;
         }
         if (sock->m_busy_send)
-            DEBUG_MESSAGE("Clearing busy_send\n");
-        sock->m_busy_send = 0;
+        {
+            DEBUG_MESSAGE("Clearing busy_send sock: %p\n", sock);
+            sock->m_busy_send = 0;
+        }
 		return 0;
     }
     if (sock->m_busy_send)
-        DEBUG_MESSAGE("Clearing busy_send\n");
+    {
+        DEBUG_MESSAGE("Clearing busy_send sock: %p\n", sock);
+        sock->m_busy_send = 0;
+    }
     DEBUG_MESSAGE("Error in send: %s\n", strerror(orig_errno));
     snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
              "Error in send: %s", strerror(orig_errno));
-    sock->m_busy_send = 0;
     errno = orig_errno;
     return -1;
 }
@@ -1263,13 +1285,13 @@ static inline int complete_tx_only(xdp_socket_t *sock, int *released)
 {
 	unsigned int rcvd;
 	u32 idx;
-    int was_busy_send = sock->m_busy_send;
+    //int was_busy_send = sock->m_busy_send;
 
     *released = 0;
     if (kick_tx(sock))
         return -1;
-    if (was_busy_send)
-        return 0;
+    //if (was_busy_send)
+    //    return 0;
     rcvd = xsk_ring_cons__peek(&sock->m_xdp_prog->m_umem[sock->m_queue].cq, 64, &idx);
     if (rcvd > 0)
     {
@@ -1419,6 +1441,162 @@ void *xdp_get_send_buffer(xdp_socket_t *sock)
     return (void *)((char *)buffer + xdp_send_udp_headroom(sock));
 }
 
+static void update_header(xdp_socket_t *sock)
+{
+    struct ethhdr *eth;
+
+    DEBUG_MESSAGE("Just updating the header (just addr changes)\n");
+
+    eth = (struct ethhdr *)sock->m_reqs->m_rec.m_header;
+    memcpy(eth->h_dest, &sock->m_reqs->m_mac, sizeof(eth->h_dest));
+
+    if (sock->m_reqs->m_rec.m_ip4)
+    {
+        struct iphdr *iph;
+        memcpy(&sock->m_reqs->m_rec.m_addr.in6_u.u6_addr32[0],
+               &sock->m_reqs->m_sa_in, 4);
+        iph = (struct iphdr *)(eth + 1);
+        iph->daddr = sock->m_reqs->m_sa_in.sin_addr.s_addr;
+    }
+    //TODO
+    //else
+    //    memcpy(&sock->m_reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
+    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
+}
+
+static void rebuild_header(xdp_socket_t *sock, char *pkt,
+                           struct sockaddr *sockaddr)
+{
+    int header_pos;
+
+    sock->m_reqs->m_sendable = 1;
+    sock->m_reqs->m_rec.m_addr_set = 1;
+    sock->m_reqs->m_rec.m_ip4 = ((struct sockaddr_in *)sockaddr)->sin_family == AF_INET;
+    if (sock->m_reqs->m_rec.m_ip4)
+        memcpy(&sock->m_reqs->m_rec.m_addr.in6_u.u6_addr32[0],
+               &((struct sockaddr_in *)sockaddr)->sin_addr, 4);
+    else
+        memcpy(&sock->m_reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
+    // m_port has already been set.
+    sock->m_reqs->m_rec.m_ip_index = sizeof(struct ethhdr);
+    sock->m_reqs->m_rec.m_header_size = xdp_send_udp_headroom(sock);
+    memcpy(sock->m_reqs->m_rec.m_header, pkt, sock->m_reqs->m_rec.m_header_size);
+    DEBUG_MESSAGE("recv, build sendable header %s, raw:\n",
+                  sock->m_reqs->m_rec.m_ip4 ? "ipv4" : "ipv6");
+    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
+    // Reverse the fields where appropriate.
+    memcpy(sock->m_reqs->m_rec.m_header, ((struct ethhdr *)pkt)->h_source,
+           sizeof(((struct ethhdr *)pkt)->h_source));
+    memcpy(((struct ethhdr *)sock->m_reqs->m_rec.m_header)->h_source, pkt,
+           sizeof(((struct ethhdr *)pkt)->h_source));
+    header_pos = sizeof(struct ethhdr);
+    if (sock->m_reqs->m_rec.m_ip4)
+    {
+        struct iphdr *iphdr_save, *iphdr_pkt;
+        iphdr_save = (struct iphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
+        iphdr_pkt = (struct iphdr *)(pkt + header_pos);
+        iphdr_save->saddr = iphdr_pkt->daddr;
+        iphdr_save->daddr = iphdr_pkt->saddr;
+        header_pos += sizeof(struct iphdr);
+    }
+    else
+    {
+        struct ipv6hdr *ipv6hdr_save, *ipv6hdr_pkt;
+        ipv6hdr_save = (struct ipv6hdr *)(sock->m_reqs->m_rec.m_header + header_pos);
+        ipv6hdr_pkt = (struct ipv6hdr *)(pkt + header_pos);
+        memcpy(&ipv6hdr_save->saddr, &ipv6hdr_pkt->daddr, sizeof(struct in6_addr));
+        memcpy(&ipv6hdr_save->daddr, &ipv6hdr_pkt->saddr, sizeof(struct in6_addr));
+        header_pos += sizeof(struct ipv6hdr);
+    }
+    {
+        struct udphdr *udphdr_save, *udphdr_pkt;
+        udphdr_save = (struct udphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
+        udphdr_pkt = (struct udphdr *)(pkt + header_pos);
+        udphdr_save->source = udphdr_pkt->dest;
+        udphdr_save->dest = udphdr_pkt->source;
+        header_pos += sizeof(struct udphdr);
+    }
+    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
+}
+
+static int get_remote_info(xdp_socket_t *sock, struct sockaddr *addr)
+{
+    char pkt[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)];
+    struct ethhdr *eth;
+    struct iphdr *iph;
+    ip2mac_data_t data;
+    unsigned char *mac = data.m_mac;
+
+    // TODO Don't forget IP6!
+    if (ip2mac_lookup(sock->m_xdp_prog->m_ip2mac_fd,
+                      ((struct sockaddr_in *)addr)->sin_addr.s_addr, &data))
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Can't lookup address: %s\n", strerror(err));
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Can't lookup address: %s", strerror(err));
+        errno = err;
+        return -1;
+    }
+    memcpy(&sock->m_reqs->m_sa_in, addr, sizeof(sock->m_reqs->m_sa_in));
+    memcpy(&sock->m_reqs->m_mac, mac, sizeof(sock->m_reqs->m_mac));
+    DEBUG_MESSAGE("Hardware address: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    // TODO: If the address type changes I must rebuild the header as well
+    if (sock->m_reqs->m_sendable)
+    {
+        //printf("Change remote addr to %u.%u.%u.%u\n",
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[0],
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[1],
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[2],
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[3]);
+        update_header(sock);
+    }
+    else
+    {
+        memset(pkt, 0, sizeof(pkt));
+        eth = (struct ethhdr *)pkt;
+        memcpy(eth->h_source, mac, sizeof(eth->h_dest));
+        memcpy(eth->h_dest, sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
+               sizeof(eth->h_source));
+        eth->h_proto = __constant_htons(ETH_P_IP);
+        iph = (struct iphdr *)(eth + 1);
+        iph->version = 4;
+        iph->ihl = 5;
+        iph->ttl = 20;
+        iph->protocol = 17; // UDP
+        iph->daddr = sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_sa_in.sin_addr.s_addr;
+        iph->saddr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
+        rebuild_header(sock, pkt, addr);
+    }
+    return 0;
+}
+
+static int check_send_addr(xdp_socket_t *sock, struct sockaddr *addr)
+{
+    if (((struct sockaddr_in *)addr)->sin_family == AF_INET6)
+    {
+    	DEBUG_MESSAGE("IPv4 only supported for separate send/recv\n");
+        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "IPv4 only supported for separate send/recv");
+        return -1;
+    }
+    if (sock->m_reqs->m_sendable &&
+        (!((struct sockaddr_in *)addr)->sin_addr.s_addr ||
+         ((struct sockaddr_in *)addr)->sin_addr.s_addr == sock->m_reqs->m_sa_in.sin_addr.s_addr))
+        // Use the one in cache
+        return 0;
+
+    DEBUG_MESSAGE("check_send_addr: family: %u addr: %u.%u.%u.%u port: %d\n",
+                  ((struct sockaddr_in *)addr)->sin_family,
+                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[0],
+                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[1],
+                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[2],
+                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[3],
+                  __constant_htons(((struct sockaddr_in *)addr)->sin_port));
+    return get_remote_info(sock, addr);
+}
+
 static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
                      struct sockaddr *addr)
 {
@@ -1430,12 +1608,17 @@ static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
     ip_index = sock->m_reqs->m_rec.m_ip_index;
     if (sock->m_reqs->m_rec.m_ip4)
     {
+        struct ethhdr *ethhdr = (struct ethhdr *)buffer_char;
+        memcpy(ethhdr->h_dest, sock->m_reqs->m_mac, sizeof(ethhdr->h_dest));
         struct iphdr *iphdr = (struct iphdr *)&buffer_char[ip_index];
         DEBUG_MESSAGE("TX: ip_index begins at %d\n", ip_index);
         iphdr->ihl = 5;
         iphdr->tot_len = __constant_htons(20 + sizeof(struct udphdr) + len);
+        iphdr->id = 0;
+        iphdr->frag_off = 0;
         iphdr->ttl = 20;
         iphdr->protocol = 17; // UDP
+        iphdr->daddr = sock->m_reqs->m_sa_in.sin_addr.s_addr;
         iphdr->check = 0;
         iphdr->check = checksum(iphdr, sizeof(struct iphdr));
         DEBUG_MESSAGE("TX: addr: %p, port: %d, in_port: %d\n", addr,
@@ -1470,6 +1653,7 @@ static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
     return tx_only(sock, buffer, len + headroom, last);
 }
 
+time_t last_send = 0;
 static int x_send(xdp_socket_t *sock, void *data, int len, int last,
                   struct sockaddr *addr, int must_zero_copy)
 {
@@ -1477,6 +1661,12 @@ static int x_send(xdp_socket_t *sock, void *data, int len, int last,
     char *send_buffer;
     char *data_char = data;
     int released;
+
+    time_t now;
+    time(&now);
+    if (last_send && now > last_send + 1)
+        assert(0);
+    last_send = now;
 
     if (sock->m_busy_send)
     {
@@ -1504,6 +1694,8 @@ static int x_send(xdp_socket_t *sock, void *data, int len, int last,
             return 0;
         }
     }
+    if (check_send_addr(sock, addr))
+        return -1;
     sock->m_xdp_prog->m_umem[sock->m_queue].m_last_send_buffer = NULL;
     if (!sock->m_reqs->m_sendable)
     {
@@ -1698,61 +1890,6 @@ static int recv_return_raw(xdp_socket_t *sock, void *buffer)
 }
 
 
-static void rebuild_header(xdp_socket_t *sock, char *pkt,
-                           struct sockaddr *sockaddr)
-{
-    int header_pos;
-
-    sock->m_reqs->m_sendable = 1;
-    sock->m_reqs->m_rec.m_addr_set = 1;
-    sock->m_reqs->m_rec.m_ip4 = ((struct sockaddr_in *)sockaddr)->sin_family == AF_INET;
-    if (sock->m_reqs->m_rec.m_ip4)
-        memcpy(&sock->m_reqs->m_rec.m_addr.in6_u.u6_addr32[0],
-               &((struct sockaddr_in *)sockaddr)->sin_addr, 4);
-    else
-        memcpy(&sock->m_reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
-    // m_port has already been set.
-    sock->m_reqs->m_rec.m_ip_index = sizeof(struct ethhdr);
-    sock->m_reqs->m_rec.m_header_size = xdp_send_udp_headroom(sock);
-    memcpy(sock->m_reqs->m_rec.m_header, pkt, sock->m_reqs->m_rec.m_header_size);
-    DEBUG_MESSAGE("recv, build sendable header %s, raw:\n",
-                  sock->m_reqs->m_rec.m_ip4 ? "ipv4" : "ipv6");
-    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
-    // Reverse the fields where appropriate.
-    memcpy(sock->m_reqs->m_rec.m_header, ((struct ethhdr *)pkt)->h_source,
-           sizeof(((struct ethhdr *)pkt)->h_source));
-    memcpy(((struct ethhdr *)sock->m_reqs->m_rec.m_header)->h_source, pkt,
-           sizeof(((struct ethhdr *)pkt)->h_source));
-    header_pos = sizeof(struct ethhdr);
-    if (sock->m_reqs->m_rec.m_ip4)
-    {
-        struct iphdr *iphdr_save, *iphdr_pkt;
-        iphdr_save = (struct iphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
-        iphdr_pkt = (struct iphdr *)(pkt + header_pos);
-        iphdr_save->saddr = iphdr_pkt->daddr;
-        iphdr_save->daddr = iphdr_pkt->saddr;
-        header_pos += sizeof(struct iphdr);
-    }
-    else
-    {
-        struct ipv6hdr *ipv6hdr_save, *ipv6hdr_pkt;
-        ipv6hdr_save = (struct ipv6hdr *)(sock->m_reqs->m_rec.m_header + header_pos);
-        ipv6hdr_pkt = (struct ipv6hdr *)(pkt + header_pos);
-        memcpy(&ipv6hdr_save->saddr, &ipv6hdr_pkt->daddr, sizeof(struct in6_addr));
-        memcpy(&ipv6hdr_save->daddr, &ipv6hdr_pkt->saddr, sizeof(struct in6_addr));
-        header_pos += sizeof(struct ipv6hdr);
-    }
-    {
-        struct udphdr *udphdr_save, *udphdr_pkt;
-        udphdr_save = (struct udphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
-        udphdr_pkt = (struct udphdr *)(pkt + header_pos);
-        udphdr_save->source = udphdr_pkt->dest;
-        udphdr_save->dest = udphdr_pkt->source;
-        header_pos += sizeof(struct udphdr);
-    }
-    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
-}
-
 int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr,
              socklen_t *addrlen)
 {
@@ -1913,142 +2050,8 @@ const char *xdp_get_last_error(xdp_prog_t *prog)
 }
 
 
-static int get_remote_info(xdp_socket_t *sock, struct sockaddr *addr)
+void xdp_change_in_port ( xdp_socket_t* sock, __u16 port )
 {
-    char pkt[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)];
-    struct ethhdr *eth;
-    struct iphdr *iph;
-
-    /* Theoretically SIOCGARP should work.  But it doesn't.  And the
-     * /proc/net/arp table has what I need.  Good enough for now.
-    struct arpreq areq;
-    memset(&areq, 0, sizeof(areq));
-    areq.arp_pa.sa_family = AF_INET;
-    ((struct sockaddr_in *)areq.arp_pa.sa_data)->sin_addr.s_addr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0)
-    {
-        int err = errno;
-    	DEBUG_MESSAGE("Socket creation error: %s\n", strerror(err));
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "xdp_set_sendable socket creation error: %s", strerror(err));
-        return -1;
-    }
-    if (ioctl(s, SIOCGARP, &areq) < 0)
-    {
-        int err = errno;
-        close(s);
-    	DEBUG_MESSAGE("ioctl error: %s\n", strerror(err));
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "xdp_set_sendable ioctl error: %s", strerror(err));
-        return -1;
-    }
-    close(s);
-    DEBUG_MESSAGE("Hardware address: %02x:%02x:%02x:%02x:%02x:%02x flags: 0x%x, dev: %s\n",
-                  ((unsigned char *)&areq.arp_ha.sa_data)[0],
-                  ((unsigned char *)&areq.arp_ha.sa_data)[1],
-                  ((unsigned char *)&areq.arp_ha.sa_data)[2],
-                  ((unsigned char *)&areq.arp_ha.sa_data)[3],
-                  ((unsigned char *)&areq.arp_ha.sa_data)[4],
-                  ((unsigned char *)&areq.arp_ha.sa_data)[5],
-                  areq.arp_flags,
-                  areq.arp_dev);
-    */
-    FILE *fh = fopen("/proc/net/arp", "r");
-    if (!fh)
-    {
-        int err = errno;
-        DEBUG_MESSAGE("Can't open arp table file: %s\n", strerror(err));
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can't open arp table file: %s", strerror(err));
-        return -1;
-    }
-    char line[256];
-    int found = 0;
-    char addr_str[80];
-    unsigned char mac[6];
-    snprintf(addr_str, sizeof(addr_str), "%u.%u.%u.%u",
-             ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[0],
-             ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[1],
-             ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[2],
-             ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[3]);
-    while (fgets(line, sizeof(line), fh))
-    {
-        if (!strncmp(line, addr_str, strlen(addr_str)))
-        {
-            DEBUG_MESSAGE("Found address %s in line: %s", addr_str, line);
-            char *colon = strchr(line, ':');
-            char *hex_char = (colon - 2);
-            int index = 0;
-            int pos = 0;
-            if (strlen(hex_char) > 18)
-            {
-                while ((index < 5 && hex_char[pos + 2] == ':') ||
-                       (index == 5 && hex_char[pos + 2] == ' '))
-                {
-                    mac[index] = ((isdigit(hex_char[pos]) ? (hex_char[pos] - '0') : (hex_char[pos] - 'a' + 10)) * 16) +
-                                 (isdigit(hex_char[pos + 1]) ? (hex_char[pos + 1] - '0') : (hex_char[pos + 1] - 'a' + 10));
-                    ++index;
-                    pos += 3;
-                }
-                if (index == 6)
-                {
-                    found = 1;
-                    break;
-                }
-            }
-        }
-        DEBUG_MESSAGE("Skip line: %s", line);
-    }
-    fclose(fh);
-    if (!found)
-    {
-        DEBUG_MESSAGE("Can't find IP address in table\n");
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can't find IP address in table");
-        return -1;
-    }
-    memcpy(&sock->m_reqs->m_sa_in, addr, sizeof(sock->m_reqs->m_sa_in));
-    memcpy(&sock->m_reqs->m_mac, mac, sizeof(sock->m_reqs->m_mac));
-    DEBUG_MESSAGE("Hardware address: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    memset(pkt, 0, sizeof(pkt));
-    eth = (struct ethhdr *)pkt;
-    memcpy(eth->h_source, mac, sizeof(eth->h_dest));
-    memcpy(eth->h_dest, sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
-           sizeof(eth->h_source));
-    eth->h_proto = __constant_htons(ETH_P_IP);
-    iph = (struct iphdr *)(eth + 1);
-    iph->version = 4;
-    iph->ihl = 5;
-    iph->ttl = 20;
-    iph->protocol = 17; // UDP
-    iph->daddr = sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_sa_in.sin_addr.s_addr;
-    iph->saddr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
-    rebuild_header(sock, pkt, addr);
-    return 0;
-}
-
-int xdp_set_sendable(xdp_socket_t *sock, struct sockaddr *addr)
-{
-    if (((struct sockaddr_in *)addr)->sin_family != AF_INET)
-    {
-    	DEBUG_MESSAGE("IPv4 only supported for separate send/recv\n");
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "IPv4 only supported for separate send/recv");
-        return -1;
-    }
-    if (sock->m_reqs->m_sendable &&
-        ((struct sockaddr_in *)addr)->sin_addr.s_addr == sock->m_reqs->m_sa_in.sin_addr.s_addr)
-        // Use the one in cache
-        return 0;
-
-    DEBUG_MESSAGE("xdp_set_sendable: family: %u addr: %u.%u.%u.%u port: %d\n",
-                  ((struct sockaddr_in *)addr)->sin_family,
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[0],
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[1],
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[2],
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[3],
-                  __constant_htons(((struct sockaddr_in *)addr)->sin_port));
-    return get_remote_info(sock, addr);
+    DEBUG_MESSAGE("xdp_change_in_port from %d to %d\n", sock->m_in_port, port);
+    sock->m_in_port = port;
 }

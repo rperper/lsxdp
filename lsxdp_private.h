@@ -112,6 +112,7 @@ typedef struct xdp_prog_s
     int                     m_shards;
     int                     m_shard; // 0 for parent or only task.
     int                     m_child;
+    int                     m_ip2mac_fd;
 } xdp_prog_t;
 
 

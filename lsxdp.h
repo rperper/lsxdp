@@ -49,6 +49,12 @@ extern "C" {
 xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
                           int max_frame_size);
 /**
+ * @fn xdp_get_debug
+ * @brief Returns the internal debugging flag.
+ * @returns The internal debugging flag.
+ **/
+int xdp_get_debug(void);
+/**
  * @fn xdp_debug
  * @brief Allows you to turn on/off debugging.  It sets a static so it can be
  *        done anytime.
@@ -147,9 +153,8 @@ void *xdp_get_send_buffer(xdp_socket_t *sock);
  * the supplied packet length.
  * @param[in] last 1 if this is the last (kick it now) or 0 if there are more
  * to send.
- * @param[in] addr Actually only the port is used (the socket has to already
- * have the IP address) and the port is the destination port if set to deal with
- * NAT devices.
+ * @param[in] addr The destination address and port.  Required (in case they
+ *                 change!)
  * @returns -1 for an error or 0 for success.
  **/
 int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
@@ -165,9 +170,8 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
  * @param[in] len The length of the data to send (not including the headroom).
  * @param[in] last 1 if this is the last (kick it now) or 0 if there are more
  * to send.
- * @param[in] addr Actually only the port is used (the socket has to already
- * have the IP address) and the port is the destination port if set to deal with
- * NAT devices.
+ * @param[in] addr The destination address and port.  Required (in case they
+ *                 change!)
  * @returns -1 for an error or 0 for success.
  **/
 int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
@@ -266,14 +270,14 @@ void xdp_assign_shard(xdp_prog_t *prog, int shard);
 int xdp_get_shard(xdp_prog_t *prog);
 
 /**
- * @fn xdp_set_sendable
- * @brief Given an IP address and a situation where you can't receive or send
- *        a ping, do the ioctl work to prebuild the header for send.
+ * @fn xdp_change_in_port
+ * @brief If you've created your socket, but need to change the listening port
+ *        (for UDP receives for example), do it here.
  * @param[in] sock The socket structure.
- * @param[in] addr The address to build the header for.
- * @returns -1 for a reportable error, 0 if it worked.
+ * @param[in] port The port to now use.
+ * @returns None.
  **/
-int xdp_set_sendable(xdp_socket_t *sock, struct sockaddr *addr);
+void xdp_change_in_port(xdp_socket_t *sock, __u16 port);
 
 /**
  * @fn xdp_prog_done
