@@ -5,6 +5,7 @@ SET(lsxdp_STAT_SRCS
     lsxdp.c
     bpf_xdp.c
     ip2mac.c
+    sendbufs.c
 )
 
 add_custom_target(xdp_sock_kern ALL

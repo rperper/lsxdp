@@ -16,7 +16,6 @@ extern "C" {
 
 #define LSXDP_PRIVATE_MAX_ERR_LEN   256
 
-#define NUM_FRAMES (4 * 1024)
 #define BATCH_SIZE 64
 #define MAX_SOCKS  8
 
@@ -29,6 +28,9 @@ typedef __u64 u64;
 typedef __u32 u32;
 
 #define MAX_QUEUES 10
+#define MAX_PEEK   16
+
+struct send_bufs_s;
 
 /* One of these xsk_umem_info structures per queue */
 /* See m_umem below and the queue number is the index into this array.  */
@@ -37,24 +39,12 @@ struct xsk_umem_info {
 	struct xsk_ring_cons cq;
 	struct xsk_umem *umem;
 	void *buffer;
-    int   m_tx_base;
-    int   m_tx_max;
-    int   m_tx_count;
-    int   m_pending_recv;
-    void *m_last_send_buffer;
-    int   m_recv_no_effect;
-    void *m_bufs;
 };
 
 struct xsk_socket_info {
 	struct xsk_ring_cons rx;
 	struct xsk_ring_prod tx;
 	struct xsk_socket *xsk;
-	unsigned long rx_npkts;
-	unsigned long tx_npkts;
-	unsigned long prev_rx_npkts;
-	unsigned long prev_tx_npkts;
-	u32 outstanding_tx;
 };
 
 struct xdp_prog_s;
@@ -81,8 +71,17 @@ typedef  struct xdp_socket_s
     int                     m_last_tx_frame_size;
     int                     m_busy_send;
     int                     m_filter_map;
-    int                     m_send_only;
     __u16                   m_in_port;
+    /* These are here because the memory is broken up by shard/queue (thus socket) */
+    struct send_bufs_s     *m_send_bufs;
+    int                     m_tx_base;
+    int                     m_tx_max;
+    int                     m_tx_count;
+    int                     m_tx_last;
+    int                     m_tx_outstanding;     // By network
+    int                     m_tx_allocated;       // By application
+    int                     m_pending_recv;
+    void                   *m_last_send_buffer;
 } xdp_socket_t;
 
 typedef struct xdp_if_s
@@ -113,6 +112,11 @@ typedef struct xdp_prog_s
     int                     m_shard; // 0 for parent or only task.
     int                     m_child;
     int                     m_ip2mac_fd;
+    int                     m_send_only;
+    __u64                   m_max_memory;
+    int                     m_max_frames; // To avoid redoing the math all of the time.
+    int                     m_multi_queue;
+    int                     m_max_queues;
 } xdp_prog_t;
 
 

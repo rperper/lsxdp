@@ -41,13 +41,25 @@ extern "C" {
  * @brief Call once when the program starts.  Call xdp_prog_done when completed
  * @param[in] max_frame_size Probably should be hard-coded at 1500
  * @param[in] prog_init_err_len Maximum length of prog_init_err.
+ * @param[in] max_memory The maximum amount of memory to be used for packets.
+ * @param[in] send_only 1 if this is a send-only program, 0 if it is send and
+ *                      receive.
+ * @param[in] multi_queue 1 if this is a multi-queue program.  At this time it
+ *            is required that each socket be on a separate queue for proper
+ *            memory management.
+ * @param[in] multi_shard 1 if this is a multi-shard program.  For the same
+ *            reasons as multi-queue.
+ * @param[in] max_queues_shards Set as a single value so you can't forget that
+ *            you can't have multiple queues and shards that are different.
+ *            0 if both of the flags above are off.
  * @param[out] prog_init_err Any errors that should be logged if this function
  *                           returns NULL.
  * @returns A pointer to xdp_prog_t if successful or NULL if an error can be
  *          reported.
  **/
 xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
-                          int max_frame_size);
+                          int max_frame_size, __u64 max_memory, int send_only,
+                          int multi_queue, int multi_shard, int max_queues_shards);
 /**
  * @fn xdp_get_debug
  * @brief Returns the internal debugging flag.
@@ -70,17 +82,15 @@ void xdp_debug(int on);
  *                 xdp_get_socket_reqs to obtain this info and leave it
  *                 allocated through the life of this socket.
  * @param[in] port The port to use for UDP traffic.
- * @param[in] send_only Whether this is a send only socket or a send/recv socket.
  * @param[in] queue The 0 based queue number
  * @returns A pointer to xdp_socket_t if successful and NULL if an error can be
  *          reported.
  * @note reqs is not freed when the socket is freed so you can reuse it for
  *       another socket call.
- * @note Forked children who called xdp_socket_parent should call
- *       xdp_socket_child instead of this call.
+ * @note Only one socket per queue has been tested.
  **/
 xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port,
-                         int send_only, int queue);
+                         int queue);
 /**
  * @fn xdp_get_socket_reqs
  * @brief Sets up the environment to build a socket.  You must call this once
@@ -142,6 +152,15 @@ int xdp_get_poll_fd(xdp_socket_t *sock);
  * specified packet size.
  **/
 void *xdp_get_send_buffer(xdp_socket_t *sock);
+
+/**
+ * @fn xdp_release_send_buffer
+ * @brief Returns a send buffer to reuse.
+ * @param[in] sock The socket to release from.
+ * @param[in] buffer The buffer to release.
+ * @returns Whether the buffer could be released.
+ **/
+int xdp_release_send_buffer(xdp_socket_t *sock, void *buffer);
 
 /**
  * @fn xdp_send
@@ -240,17 +259,6 @@ void xdp_socket_close(xdp_socket_t *socket);
  * @returns -1 if the filter can't be added.
  **/
 int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey, int shard);
-
-/**
- * @fn xdp_init_shards
- * @brief Call from the parent before a fork, the number of children to be
- *        forked.
- * @param[in] prog The program structure.
- * @param[in] shards The number of shards to prepare for.
- * @returns None.
- * @warning MUST BE CALLED BEFORE CREATING SOCKETS!
- **/
-void xdp_init_shards(xdp_prog_t *prog, int shards);
 
 /**
  * @fn xdp_assign_shard
