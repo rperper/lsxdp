@@ -251,6 +251,19 @@ int xdp_recv_return(xdp_socket_t *sock, void *data);
 void xdp_socket_close(xdp_socket_t *socket);
 
 /**
+ * @fn xdp_socket_close_child
+ * @brief Call to close a socket previously opened with xdp_socket in a child
+ *        process where another process is known to own the socket (a parent or
+ *        another child).
+ * @param[in] xdp_socket_t The socket previously created with xdp_prog_init
+ * @note If you use xdp_socket_close from a child, any other owners of this
+ * socket will lose receive access as the eBPF filter map will have its value
+ * removed!
+ * @returns None
+ **/
+void xdp_socket_close_child(xdp_socket_t *socket);
+
+/**
  * @fn xdp_add_ip_filter
  * @brief Lets you add an IP to accept from.  All other UDP packets are dropped.
  * @param[in] xdp_socket_t The socket previously created with xdp_prog_init

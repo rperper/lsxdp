@@ -49,7 +49,6 @@ int debug_message(const char *format, ...)
 #define TRACE_BUFFER_DEBUG_MESSAGE
 #include "traceBuffer.h"
 
-#define USE_PING
 #define USE_SHARED_MEM
 
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not set */
@@ -173,6 +172,69 @@ static int xsk_configure_umem(xdp_prog_t *prog, int queue, u64 size)
 	return 0;
 }
 
+static int find_map_fd(xdp_socket_t *sock, const char *mapname)
+{
+    xdp_prog_t *prog = sock->m_xdp_prog;
+    int queue = sock->m_queue;
+    struct bpf_map *map;
+    int fd;
+
+    map = bpf_object__find_map_by_name(prog->m_if[queue].m_bpf_object, mapname);
+    if (!map)
+    {
+        DEBUG_MESSAGE("Can not find map by name: %s\n", mapname);
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Can not find map by name: %s", mapname);
+        return -1;
+    }
+
+    errno = 0;
+	fd = bpf_map__fd(map);
+    if (fd < 0)
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Error get fd from map name: %s\n", strerror(err));
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Error get fd from map name: %s\n", strerror(err));
+        return -1;
+    }
+    return fd;
+}
+
+#ifdef ADD_MAP_MANUALLY
+static int add_to_socket_map(xdp_socket_t *sock)
+{
+    xdp_prog_t *prog = sock->m_xdp_prog;
+    int queue = sock->m_queue;
+    int pollfd;
+    int err;
+
+    /* Does the job that turning off XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD would
+       do for a multi-queue environment without breaking if a child close is
+       done. */
+    DEBUG_MESSAGE("Add queue: %d to map\n", queue);
+    if (prog->m_if[queue].m_xsks_map_fd <= 0)
+    {
+        prog->m_if[queue].m_xsks_map_fd = find_map_fd(sock, "xsks_map");
+        if (prog->m_if[queue].m_xsks_map_fd < 0)
+            return -1;
+    }
+    pollfd = xdp_get_poll_fd(sock);
+    err = bpf_map_update_elem(prog->m_if[queue].m_xsks_map_fd, &queue, &pollfd,
+                              0);
+    close(prog->m_if[queue].m_xsks_map_fd);
+    prog->m_if[queue].m_xsks_map_fd = -1;
+    if (err)
+    {
+        DEBUG_MESSAGE("Can not update map element: %d \n", err);
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Error updating map element");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static int xsk_configure_socket(xdp_socket_t *sock)
 {
 	struct xsk_socket_config cfg;
@@ -193,7 +255,11 @@ static int xsk_configure_socket(xdp_socket_t *sock)
     }
 	cfg.rx_size = pending_recv(prog);
 	cfg.tx_size = max_send(prog);
-	cfg.libbpf_flags = prog->m_if[ifindex].m_socket_attached ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD : 0;
+#ifdef ADD_MAP_MANUALLY
+    cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+#else
+    cfg.libbpf_flags = (prog->m_multi_queue || !prog->m_if[ifindex].m_socket_attached) ? 0 : XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+#endif
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = opt_xdp_bind_flags/* | child ? XDP_SHARED_UMEM : 0*/;
     DEBUG_MESSAGE("xsk_socket__create queue: %d, send_only: %d, libbpf_flags: "
@@ -208,11 +274,11 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                              &sock->m_sock_info->tx, &cfg);
 	if (ret)
     {
-        DEBUG_MESSAGE("xsk_socket__create error %s (%d) index: %d name: %s\n",
+        DEBUG_MESSAGE("xsk_socket__create error %s (%d) ifindex: %d name: %s\n",
                       strerror(-ret), -ret, ifindex,
                       sock->m_xdp_prog->m_if[ifindex].m_ifname);
         snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "xsk_socket__create error %s index: %d name: %s", strerror(-ret),
+                 "xsk_socket__create error %s ifindex: %d name: %s", strerror(-ret),
                  ifindex, prog->m_if[ifindex].m_ifname);
         return -1;
     }
@@ -227,43 +293,37 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                  "bpf_get_link_xdp_id error %s", strerror(-ret));
 		return -1;
     }
+#ifdef ADD_MAP_MANUALLY
+    if (sock->m_xdp_prog->m_if[ifindex].m_bpf_object && add_to_socket_map(sock))
+        return -1;
+#endif
+    sock->m_pending_recv = pending_recv(prog);
+    sock->m_tx_base = shard_base(prog) + pending_recv(prog);
+    sock->m_tx_max = max_send(prog);
     if (!prog->m_send_only)
     {
-        ret = xsk_ring_prod__reserve(&sock->m_xdp_prog->m_umem[sock->m_queue].fq,
-                                     pending_recv(sock->m_xdp_prog), &idx);
+        ret = xsk_ring_prod__reserve(&prog->m_umem[queue].fq,
+                                     pending_recv(prog), &idx);
         DEBUG_MESSAGE("Put a lot packets into the fill queue so they can be used "
                       "for recv, starting at index: %d\n", idx);
-        if (ret != pending_recv(sock->m_xdp_prog))
+        if (ret != pending_recv(prog))
         {
             DEBUG_MESSAGE("xsk_ring_prod__reserve: ret: %d != pending_recv: %d\n",
-                          ret, pending_recv(sock->m_xdp_prog));
-            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                          ret, pending_recv(prog));
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "xsk_ring_prod__reserve error %s", strerror(-ret));
             return -1;
         }
-        sock->m_pending_recv = pending_recv(prog);
-        sock->m_tx_base = shard_base(prog) + pending_recv(prog);
-        sock->m_tx_max = max_send(sock->m_xdp_prog);
-        DEBUG_MESSAGE("pending_recv: %d, tx_base: %d rx buffer_index: %d..%d\n",
+        DEBUG_MESSAGE("pending_recv: %d, tx_base: %d rx buffer range: %d..%d\n",
                       sock->m_pending_recv,
                       sock->m_tx_base,
                       shard_base(prog),
                       shard_base(prog) + pending_recv(prog) + max_send(prog));
         for (i = 0; i < pending_recv(prog); i++)
-            *xsk_ring_prod__fill_addr(&prog->m_umem[queue].fq, i/*idx++*/) =
+            *xsk_ring_prod__fill_addr(&prog->m_umem[queue].fq, idx++) =
                 (i + shard_base(prog)) * prog->m_max_frame_size;
         xsk_ring_prod__submit(&prog->m_umem[queue].fq,
                               pending_recv(prog));
-    }
-    else
-    {
-        /**
-         * TODO: Make send-only more buffer efficient by not counting the non-
-         * existant receives.
-         **/
-        sock->m_pending_recv = pending_recv(prog);
-        sock->m_tx_base = shard_base(prog) + pending_recv(prog);
-        sock->m_tx_max = max_send(prog);
     }
     if (send_bufs_init(sock))
         return -1;
@@ -449,6 +509,7 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
     prog->m_max_frames = prog->m_max_memory / prog->m_max_frame_size;
     prog->m_max_memory = prog->m_max_frames * prog->m_max_frame_size;
     prog->m_multi_queue = multi_queue;
+    prog->m_pid_parent = getpid();
     if (multi_shard)
         prog->m_shards = max_queues_shards;
     if (multi_queue)
@@ -486,9 +547,9 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
     return prog;
 }
 
-void xdp_socket_close ( xdp_socket_t* socket )
+static void x_socket_close( xdp_socket_t* socket, int child )
 {
-    DEBUG_MESSAGE("xdp_socket_close: %p\n", socket);
+    DEBUG_MESSAGE("xdp_socket_close%s: %p\n", child ? "_child" : "", socket);
     if (!socket)
         return;
 
@@ -498,31 +559,63 @@ void xdp_socket_close ( xdp_socket_t* socket )
     {
         if (socket->m_sock_info->xsk)
         {
+#ifdef ADD_MAP_MANUALLY
             DEBUG_MESSAGE("Doing xsk_socket__delete\n");
             xsk_socket__delete(socket->m_sock_info->xsk);
+#else
+            if (!child)
+            {
+                DEBUG_MESSAGE("Doing xsk_socket__delete\n");
+                xsk_socket__delete(socket->m_sock_info->xsk);
+            }
+            else
+            {
+                close(xdp_get_poll_fd(socket));
+            }
+#endif
         }
         DEBUG_MESSAGE("free sock_info\n");
         free(socket->m_sock_info);
     }
     DEBUG_MESSAGE("freeing socket\n");
-    socket->m_xdp_prog->m_num_socks--;
+    if (!child)
+        socket->m_xdp_prog->m_num_socks--;
     free(socket);
 }
 
-static void detach_ping(xdp_prog_t *prog, int force_unload)
+void xdp_socket_close_child ( xdp_socket_t* socket )
+{
+    x_socket_close(socket, 1);
+}
+
+void xdp_socket_close ( xdp_socket_t* socket )
+{
+    x_socket_close(socket, 0);
+}
+
+#ifdef ADD_MAP_MANUALLY
+static void detach_xdp_obj(xdp_prog_t *prog, int force_unload)
 {
     int i;
-    if (prog->m_shard)
+    if (prog->m_pid_parent != getpid())
     {
-        DEBUG_MESSAGE("Child: DO NOT detach_ping\n");
+        DEBUG_MESSAGE("Child: DO NOT detach_xdp_obj\n");
         return;
     }
     for (i = 1; i <= prog->m_max_if; ++i)
     {
-        if (prog->m_if[i].m_ping_attached || prog->m_if[i].m_socket_attached ||
-            force_unload)
+        if (prog->m_if[i].m_progfd > 0)
         {
-            prog->m_if[i].m_ping_attached = 0;
+            close(prog->m_if[i].m_progfd);
+            prog->m_if[i].m_progfd = -1;
+        }
+        if (prog->m_if[i].m_xsks_map_fd > 0)
+        {
+            close(prog->m_if[i].m_xsks_map_fd);
+            prog->m_if[i].m_xsks_map_fd = -1;
+        }
+        if (prog->m_if[i].m_socket_attached || force_unload)
+        {
             int rc = xdp_link_detach(prog, i, opt_xdp_flags,
                                      0/*prog->m_if[i].m_progfd*/);
             if (rc)
@@ -532,12 +625,14 @@ static void detach_ping(xdp_prog_t *prog, int force_unload)
         }
     }
 }
+#endif
 
 static int xsk_load_kern(xdp_socket_t *sock)
 {
+    xdp_prog_t *prog = sock->m_xdp_prog;
 	struct bpf_program *bpf_prog;
     int ifindex = sock->m_reqs->m_ifindex;
-    if (!sock->m_xdp_prog->m_if[ifindex].m_socket_attached)
+    if (!prog->m_send_only && !prog->m_if[ifindex].m_socket_attached)
     {
         int err;
         struct bpf_prog_load_attr prog_load_attr =
@@ -546,13 +641,12 @@ static int xsk_load_kern(xdp_socket_t *sock)
             .ifindex   = (opt_xdp_flags & XDP_FLAGS_HW_MODE) ? ifindex : 0,
         };
         prog_load_attr.file = "xdpsock_kern.o";
-        sock->m_xdp_prog->m_if[ifindex].m_bpf_prog_fd = -1;
         err = bpf_prog_load_xattr(&prog_load_attr,
-                                  &sock->m_xdp_prog->m_if[ifindex].m_bpf_object,
-                                  &sock->m_xdp_prog->m_if[ifindex].m_bpf_prog_fd);
+                                  &prog->m_if[ifindex].m_bpf_object,
+                                  &prog->m_if[ifindex].m_bpf_prog_fd);
         if (err)
         {
-            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "Error loading kernel object file(%s) (%d): %s",
                      prog_load_attr.file, err, strerror(-err));
             return -1;
@@ -561,31 +655,31 @@ static int xsk_load_kern(xdp_socket_t *sock)
         const char *prog_sec = "xdp_sock";
         DEBUG_MESSAGE("Kernel bpf_object__find_program_by_title: %s, "
                       "obj ptr: %p, prog_fd: %d, index: %d\n",
-                      prog_sec, sock->m_xdp_prog->m_if[ifindex].m_bpf_object,
-                      sock->m_xdp_prog->m_if[ifindex].m_bpf_prog_fd, ifindex);
-        bpf_prog = bpf_object__find_program_by_title(sock->m_xdp_prog->m_if[ifindex].m_bpf_object,
+                      prog_sec, prog->m_if[ifindex].m_bpf_object,
+                      prog->m_if[ifindex].m_bpf_prog_fd, ifindex);
+        bpf_prog = bpf_object__find_program_by_title(prog->m_if[ifindex].m_bpf_object,
                                                      prog_sec);
         if (!bpf_prog)
         {
-            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "Kernel load error finding progsec: %s\n", prog_sec);
             return -1;
 	    }
-        sock->m_xdp_prog->m_if[ifindex].m_progfd = bpf_program__fd(bpf_prog);
-        if (sock->m_xdp_prog->m_if[ifindex].m_progfd <= 0)
+        prog->m_if[ifindex].m_progfd = bpf_program__fd(bpf_prog);
+        if (prog->m_if[ifindex].m_progfd <= 0)
         {
-            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "Kernel load error bpf_program__fd failed");
             return -1;
 	    }
         DEBUG_MESSAGE("bpf_program__fd using prog ptr: %p progfd: %d\n",
                       bpf_prog, sock->m_xdp_prog->m_if[ifindex].m_progfd);
         int ret = bpf_set_link_xdp_fd(ifindex,
-                                      sock->m_xdp_prog->m_if[ifindex].m_progfd,
+                                      prog->m_if[ifindex].m_progfd,
                                       opt_xdp_flags);
         if (ret < 0)
         {
-            snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
                      "Kernel load error bpf_set_link_xdp_fd: %s", strerror(-ret));
             return -1;
 	    }
@@ -790,92 +884,6 @@ static int check_if(xdp_prog_t *prog, const char *ifport,
     return 0;
 }
 
-#ifdef USE_PING
-static int load_obj(xdp_prog_t *prog, const char *ifport)
-{
-	int err;
-	struct bpf_program *bpf_prog;
-    int i;
-    int enabled_one = 0;
-
-    for (i = 1; i <= prog->m_max_if; ++i)
-    {
-        if (prog->m_if[i].m_bpf_object)
-            return 0; // Already done!
-
-        if (prog->m_if[i].m_disable)
-            continue;
-
-        DEBUG_MESSAGE("For prog[%d], if: %d, name: %s\n", i,
-                      if_nametoindex(prog->m_if[i].m_ifname),
-                      prog->m_if[i].m_ifname);
-        prog->m_if[i].m_ping_attached = 0;
-
-        struct bpf_prog_load_attr prog_load_attr =
-        {
-            .prog_type = BPF_PROG_TYPE_XDP,
-            .ifindex   = (opt_xdp_flags & XDP_FLAGS_HW_MODE) ? i : 0,
-        };
-        prog_load_attr.file = "xdpsock_kern.o";
-
-        /* Use libbpf for extracting BPF byte-code from BPF-ELF object, and
-         * loading this into the kernel via bpf-syscall */
-        DEBUG_MESSAGE("bpf_prog_load_xattr, ifindex: %d\n", prog_load_attr.ifindex);
-        prog->m_if[i].m_bpf_object = NULL;
-        prog->m_if[i].m_bpf_prog_fd = -1;
-        err = bpf_prog_load_xattr(&prog_load_attr, &prog->m_if[i].m_bpf_object,
-                                  &prog->m_if[i].m_bpf_prog_fd);
-        if (err)
-        {
-            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "Error loading BPF-OBJ file(%s) (%d): %s",
-                     prog_load_attr.file, err, strerror(-err));
-            prog->m_if[i].m_disable = 1;
-            continue;
-        }
-        /* Find a matching BPF prog section name */
-        const char *prog_sec = "xdp_ping";
-        DEBUG_MESSAGE("bpf_object__find_program_by_title: %s, obj ptr: %p, prog_fd: %d\n",
-                      prog_sec, prog->m_if[i].m_bpf_object, prog->m_if[i].m_bpf_prog_fd);
-        bpf_prog = bpf_object__find_program_by_title(prog->m_if[i].m_bpf_object,
-                                                     prog_sec);
-        if (!bpf_prog)
-        {
-            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "ERR: finding progsec: %s\n", prog_sec);
-            prog->m_if[i].m_disable = 1;
-		    continue;
-	    }
-        DEBUG_MESSAGE("bpf_program__fd using prog ptr: %p\n", bpf_prog);
-        prog->m_if[i].m_progfd = bpf_program__fd(bpf_prog);
-        if (prog->m_if[i].m_progfd <= 0)
-        {
-            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "ERR: bpf_program__fd failed");
-            prog->m_if[i].m_disable = 1;
-            continue;
-	    }
-
-        DEBUG_MESSAGE("xdp_link_attach, if_index: %d %s, new prog_fd: %d\n", i,
-                      prog->m_if[i].m_ifname, prog->m_if[i].m_progfd);
-        err = xdp_link_attach(prog, i, opt_xdp_flags, prog->m_if[i].m_progfd);
-        if (err)
-        {
-            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "ERR: xdp_link_attach failed: %s", strerror(-err));
-            prog->m_if[i].m_disable = 1;
-            continue;
-        }
-        prog->m_if[i].m_ping_attached = 1;
-        enabled_one = 1;
-    }
-    if (!enabled_one)
-        // let the last error stand!
-        return -1;
-    return 0;
-}
-#endif
-
 static unsigned short checksum(void *b, int len)
 {
     unsigned short *buf = b;
@@ -892,171 +900,6 @@ static unsigned short checksum(void *b, int len)
     return result;
 }
 
-#ifdef USE_PING
-#define PING_PKT_S 64
-struct ping_pkt
-{
-    struct icmphdr hdr;
-    char msg[PING_PKT_S-sizeof(struct icmphdr)];
-};
-
-static int send_ping(xdp_prog_t *prog, const struct sockaddr *addr,
-                     socklen_t addrLen, const struct sockaddr *addr_bind)
-{
-    int sockfd;
-    int ttl_val = 64;
-    int i;
-    int poll_rc = 0;
-    int count = 0;
-    struct ping_pkt pkt;
-
-    // TODO: send_ping for ipv6
-    sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (sockfd < 0)
-    {
-        int err = errno;
-        DEBUG_MESSAGE("Error creating ping socket: %s\n", strerror(err));
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Error creating ping socket to get socket requirements: %s",
-                 strerror(err));
-        return -1;
-    }
-    if (setsockopt(sockfd, 0/*SOL_IP or 41 for v6*/, IP_TTL, &ttl_val,
-                   sizeof(ttl_val)) != 0)
-        DEBUG_MESSAGE("Error setting ttl time: %s\n", strerror(errno));
-
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.hdr.type = ICMP_ECHO;
-    pkt.hdr.un.echo.id = getpid();
-    for (i = 0; i < sizeof(pkt.msg) - 1; ++i)
-        pkt.msg[i] = i + '0';
-    pkt.msg[i] = 0;
-    while (poll_rc == 0 && count < 20)
-    {
-        struct pollfd pol;
-
-        pkt.hdr.un.echo.sequence = ++count;
-        pkt.hdr.checksum = 0;
-        pkt.hdr.checksum = checksum(&pkt, sizeof(pkt));
-
-        DEBUG_MESSAGE("Doing sendto\n");
-        poll_rc = sendto(sockfd, &pkt, sizeof(pkt), 0, addr, addrLen);
-        if (poll_rc <= 0)
-        {
-            int err = errno;
-            poll_rc = -1;
-            DEBUG_MESSAGE("sendto failed: %s\n", strerror(err));
-            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "Error sending ping to get socket requirements: %s",
-                     strerror(err));
-            break;
-        }
-        DEBUG_MESSAGE("sendto worked\n");
-
-        // Could try a recvfrom, but that complicates the code - we just need
-        // to know that there's something to receive
-        memset(&pol, 0, sizeof(pol));
-        pol.fd = sockfd;
-        pol.events = POLLIN;
-        poll_rc = poll(&pol, 1, 100);
-        if (poll_rc == 0)
-        {
-            DEBUG_MESSAGE("Poll timed out\n");
-        }
-        else if (poll_rc < 0)
-        {
-            int err = errno;
-            DEBUG_MESSAGE("Can't check for listening on ping port: %s\n",
-                          strerror(err));
-            snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                     "Error checking ping to get socket requirements: %s",
-                     strerror(err));
-        }
-        /*
-        if ( recvfrom(sockfd, &pckt, sizeof(pckt), 0,
-                      (struct sockaddr*)&r_addr, &addr_len) <= 0 )
-            printf("\nPacket receive failed!\n");
-        */
-    }
-    close(sockfd);
-    if (poll_rc == 0)
-    {
-        DEBUG_MESSAGE("Timed out waiting for ping response\n");
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Timed out waiting for ping response");
-        poll_rc = -1;
-    }
-    return (poll_rc == -1) ? -1 : 0;
-}
-#endif
-
-#ifdef USE_PING
-int find_map_fd(xdp_prog_t *prog, struct bpf_object *bpf_obj, const char *mapname)
-{
-    struct bpf_map *map;
-
-    map = bpf_object__find_map_by_name(bpf_obj, mapname);
-    if (!map)
-    {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can not find map by name: %s", mapname);
-        return -1;
-    }
-
-	return bpf_map__fd(map);
-}
-
-static int set_map(xdp_prog_t *prog, const struct sockaddr *addr,
-                   socklen_t addrLen)
-{
-    int i;
-    struct packet_rec rec;
-    int found = 0;
-    memset(&rec, 0, sizeof(rec));
-    rec.m_addr_set = 1;
-    if (addrLen == sizeof(struct sockaddr_in))
-    {
-        rec.m_addr_set  = 1;
-        rec.m_ip4       = 1;
-        rec.m_addr.in6_u.u6_addr32[0] = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
-        rec.m_port      = ((struct sockaddr_in *)addr)->sin_port;
-    }
-    else
-    {
-        DEBUG_MESSAGE("Not supporting IP6 yet\n");
-        return -1;
-    }
-    for (i = 1; i <= prog->m_max_if; ++i)
-    {
-        if (!prog->m_if[i].m_disable &&
-            prog->m_if[i].m_bpf_object)
-        {
-            int map_fd;
-            int key = 0; // Separate maps for each IF for now, all with key 0
-            map_fd = find_map_fd(prog, prog->m_if[i].m_bpf_object,
-                                 "packet_rec_def");
-            if (map_fd == -1)
-            {
-                DEBUG_MESSAGE("Can't find map fd\n");
-                return -1;
-            }
-
-            if (bpf_map_update_elem(map_fd, &key, &rec, 0) == 0)
-                found = 1;
-            else
-                DEBUG_MESSAGE("ERROR IN BPF_MAP_UPDATE_ELEM %d\n", errno);
-        }
-    }
-    if (!found)
-    {
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can not find map to set update");
-        return -1;
-    }
-    return 0;
-}
-#endif
-
 static lsxdp_socket_reqs_t *malloc_reqs(xdp_prog_t *prog, int ifindex)
 {
     lsxdp_socket_reqs_t *reqs;
@@ -1072,80 +915,147 @@ static lsxdp_socket_reqs_t *malloc_reqs(xdp_prog_t *prog, int ifindex)
     return reqs;
 }
 
-#ifdef USE_PING
-static lsxdp_socket_reqs_t *check_map(xdp_prog_t *prog,
-                                      const struct sockaddr *addr,
-                                      socklen_t addrLen)
+static void update_header(lsxdp_socket_reqs_t *reqs)
 {
-    int i;
-    struct packet_rec rec;
-    int found_index = 0;
-    lsxdp_socket_reqs_t *reqs;
+    struct ethhdr *eth;
 
-    DEBUG_MESSAGE("In check_map\n");
-    for (i = 1; i <= prog->m_max_if; ++i)
-    {
-        if (!prog->m_if[i].m_disable &&
-            prog->m_if[i].m_bpf_object)
-        {
-            int map_fd;
-            int key = 0; // Separate maps for each IF for now, all with key 0
-            DEBUG_MESSAGE("check_map, if: %d\n", i);
-            map_fd = find_map_fd(prog, prog->m_if[i].m_bpf_object,
-                                 "packet_rec_def");
-            if (map_fd == -1)
-            {
-                DEBUG_MESSAGE("map_fd == -1!!!\n");
-                return NULL;
-            }
-            int rc = bpf_map_lookup_elem(map_fd, &key, &rec);
-            if ((rc == 0 && rec.m_ip4 &&
-                ((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr == ((struct sockaddr_in *)addr)->sin_addr.s_addr))
-            {
-                DEBUG_MESSAGE("Found index at device #%d %s\n", i,
-                              prog->m_if[i].m_ifname);
-                found_index = i;
-                break;
-            }
-            else if (rc != 0)
-            {
-                DEBUG_MESSAGE("bpf_map_lookup_elem failed: %d\n", errno);
-            }
-            else if (!rec.m_header_size)
-            {
-                DEBUG_MESSAGE("Response not found (no header received)\n");
-            }
-            else if (rec.m_ip4)
-            {
-                DEBUG_MESSAGE("Unexpected IP daddr: %u.%u.%u.%u\n",
-                              ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[0],
-                              ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[1],
-                              ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[2],
-                              ((unsigned char *)&((struct iphdr *)&rec.m_header[rec.m_ip_index])->daddr)[3]);
-                traceBuffer(rec.m_header, rec.m_header_size);
-            }
-            else
-            {
-                DEBUG_MESSAGE("NOT IP 4!\n");
-            }
-        }
-    }
-    if (!found_index)
-    {
-        DEBUG_MESSAGE("Can't find map entry of successful ping\n");
-        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can not find map entry of successful ping");
-        return NULL;
-    }
+    DEBUG_MESSAGE("Just updating the header (just addr changes)\n");
 
-    if (!(reqs = malloc_reqs(prog, found_index)))
-        return NULL;
-    reqs->m_sendable = 1;
-    reqs->m_port = ((struct sockaddr_in *)addr)->sin_port;
-    memcpy(&reqs->m_rec, &rec, sizeof(rec));
-    return reqs;
+    eth = (struct ethhdr *)reqs->m_rec.m_header;
+    memcpy(eth->h_dest, &reqs->m_mac, sizeof(eth->h_dest));
+
+    if (reqs->m_rec.m_ip4)
+    {
+        struct iphdr *iph;
+        memcpy(&reqs->m_rec.m_addr.in6_u.u6_addr32[0],
+               &reqs->m_sa_in, 4);
+        iph = (struct iphdr *)(eth + 1);
+        iph->daddr = reqs->m_sa_in.sin_addr.s_addr;
+    }
+    //TODO
+    //else
+    //    memcpy(&reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
+    traceBuffer(reqs->m_rec.m_header, reqs->m_rec.m_header_size);
 }
-#endif
+
+static int send_udp_headroom(void)
+{
+    return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
+}
+
+int xdp_send_udp_headroom(xdp_socket_t *sock)
+{
+    return send_udp_headroom();
+}
+
+static void rebuild_header(lsxdp_socket_reqs_t *reqs, char *pkt,
+                           struct sockaddr *sockaddr)
+{
+    int header_pos;
+
+    reqs->m_sendable = 1;
+    reqs->m_rec.m_addr_set = 1;
+    reqs->m_rec.m_ip4 = ((struct sockaddr_in *)sockaddr)->sin_family == AF_INET;
+    if (reqs->m_rec.m_ip4)
+        memcpy(&reqs->m_rec.m_addr.in6_u.u6_addr32[0],
+               &((struct sockaddr_in *)sockaddr)->sin_addr, 4);
+    else
+        memcpy(&reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
+    // m_port has already been set.
+    reqs->m_rec.m_ip_index = sizeof(struct ethhdr);
+    reqs->m_rec.m_header_size = send_udp_headroom();
+    memcpy(reqs->m_rec.m_header, pkt, reqs->m_rec.m_header_size);
+    DEBUG_MESSAGE("recv, build sendable header %s, raw:\n",
+                  reqs->m_rec.m_ip4 ? "ipv4" : "ipv6");
+    traceBuffer(reqs->m_rec.m_header, reqs->m_rec.m_header_size);
+    // Reverse the fields where appropriate.
+    memcpy(reqs->m_rec.m_header, ((struct ethhdr *)pkt)->h_source,
+           sizeof(((struct ethhdr *)pkt)->h_source));
+    memcpy(((struct ethhdr *)reqs->m_rec.m_header)->h_source, pkt,
+           sizeof(((struct ethhdr *)pkt)->h_source));
+    header_pos = sizeof(struct ethhdr);
+    if (reqs->m_rec.m_ip4)
+    {
+        struct iphdr *iphdr_save, *iphdr_pkt;
+        iphdr_save = (struct iphdr *)(reqs->m_rec.m_header + header_pos);
+        iphdr_pkt = (struct iphdr *)(pkt + header_pos);
+        iphdr_save->saddr = iphdr_pkt->daddr;
+        iphdr_save->daddr = iphdr_pkt->saddr;
+        header_pos += sizeof(struct iphdr);
+    }
+    else
+    {
+        struct ipv6hdr *ipv6hdr_save, *ipv6hdr_pkt;
+        ipv6hdr_save = (struct ipv6hdr *)(reqs->m_rec.m_header + header_pos);
+        ipv6hdr_pkt = (struct ipv6hdr *)(pkt + header_pos);
+        memcpy(&ipv6hdr_save->saddr, &ipv6hdr_pkt->daddr, sizeof(struct in6_addr));
+        memcpy(&ipv6hdr_save->daddr, &ipv6hdr_pkt->saddr, sizeof(struct in6_addr));
+        header_pos += sizeof(struct ipv6hdr);
+    }
+    {
+        struct udphdr *udphdr_save, *udphdr_pkt;
+        udphdr_save = (struct udphdr *)(reqs->m_rec.m_header + header_pos);
+        udphdr_pkt = (struct udphdr *)(pkt + header_pos);
+        udphdr_save->source = udphdr_pkt->dest;
+        udphdr_save->dest = udphdr_pkt->source;
+        header_pos += sizeof(struct udphdr);
+    }
+    traceBuffer(reqs->m_rec.m_header, reqs->m_rec.m_header_size);
+}
+
+static int set_reqs(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
+                    struct sockaddr *addr)
+{
+    char pkt[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)];
+    struct ethhdr *eth;
+    struct iphdr *iph;
+    ip2mac_data_t data;
+    unsigned char *mac = data.m_mac;
+
+    // TODO Don't forget IP6!
+    if (ip2mac_lookup(prog->m_ip2mac_fd,
+                      ((struct sockaddr_in *)addr)->sin_addr.s_addr, &data))
+    {
+        int err = errno;
+        DEBUG_MESSAGE("Can't lookup address: %s\n", strerror(err));
+        snprintf(prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
+                 "Can't lookup address: %s", strerror(err));
+        errno = err;
+        return -1;
+    }
+    memcpy(&reqs->m_sa_in, addr, sizeof(reqs->m_sa_in));
+    memcpy(&reqs->m_mac, mac, sizeof(reqs->m_mac));
+    DEBUG_MESSAGE("Hardware address: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    // TODO: If the address type changes I must rebuild the header as well
+    if (reqs->m_sendable)
+    {
+        //printf("Change remote addr to %u.%u.%u.%u\n",
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[0],
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[1],
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[2],
+        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[3]);
+        update_header(reqs);
+    }
+    else
+    {
+        memset(pkt, 0, sizeof(pkt));
+        eth = (struct ethhdr *)pkt;
+        memcpy(eth->h_source, mac, sizeof(eth->h_dest));
+        memcpy(eth->h_dest, prog->m_if[reqs->m_ifindex].m_mac,
+               sizeof(eth->h_source));
+        eth->h_proto = __constant_htons(ETH_P_IP);
+        iph = (struct iphdr *)(eth + 1);
+        iph->version = 4;
+        iph->ihl = 5;
+        iph->ttl = 20;
+        iph->protocol = 17; // UDP
+        iph->daddr = prog->m_if[reqs->m_ifindex].m_sa_in.sin_addr.s_addr;
+        iph->saddr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
+        rebuild_header(reqs, pkt, addr);
+    }
+    return 0;
+}
 
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
                                          const struct sockaddr *addr,
@@ -1160,46 +1070,22 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
     if (check_if(prog, ifport, addr_bind, &enabled_if))
         return NULL;
 
-    DEBUG_MESSAGE("xdp_get_socket_reqs - forcably detach any loaded XDP progs "
-                  "on if #%d: %s!\n", enabled_if, prog->m_if[enabled_if].m_ifname);
-    if (xdp_link_detach(prog, enabled_if, opt_xdp_flags, 0))
-        DEBUG_MESSAGE("xdp_link_detach failed: %s\n", prog->m_err);
-
-    if (!addr)
+    if (!prog->m_send_only)
     {
-        reqs = malloc_reqs(prog, enabled_if);
-        if (!reqs)
-            return NULL;
-        reqs->m_sendable = 0;
-        return reqs;
+        DEBUG_MESSAGE("xdp_get_socket_reqs - forcably detach any loaded XDP progs "
+                      "on if #%d: %s!\n", enabled_if, prog->m_if[enabled_if].m_ifname);
+        if (xdp_link_detach(prog, enabled_if, opt_xdp_flags, 0))
+            DEBUG_MESSAGE("xdp_link_detach failed: %s\n", prog->m_err);
     }
-    DEBUG_MESSAGE("xdp_get_socket_reqs - load_obj\n");
-    if (load_obj(prog, ifport))
-        return NULL;
-    DEBUG_MESSAGE("xdp_get_socket_reqs - set_map\n");
-    if (set_map(prog, addr, addrLen) == -1)
-    {
-        detach_ping(prog, 0);
-        return NULL;
-    }
-    DEBUG_MESSAGE("xdp_get_socket_reqs - send_ping\n");
-    if (!addr_bind)
-        addr_bind = (addrLen == sizeof(struct sockaddr_in)) ?
-            (struct sockaddr *)&prog->m_if[enabled_if].m_sa_in :
-            (struct sockaddr *)&prog->m_if[enabled_if].m_sa_in6;
-    if (send_ping(prog, addr, addrLen, addr_bind))
-    {
-        detach_ping(prog, 0);
-        return NULL;
-    }
-    DEBUG_MESSAGE("xdp_get_socket_reqs - check_map\n");
-    reqs = check_map(prog, addr, addrLen);
+    reqs = malloc_reqs(prog, enabled_if);
     if (!reqs)
-    {
-        detach_ping(prog, 0);
         return NULL;
-    }
-    detach_ping(prog, 0);
+    reqs->m_sendable = 0;
+    if (!addr)
+        return reqs;
+    if (set_reqs(prog, reqs, (struct sockaddr *)addr))
+        return NULL;
+
     DEBUG_MESSAGE("xdp_get_socket_reqs - WORKED! header size %d "
                   "source mac: %02x:%02x:%02x:%02x:%02x:%02x "
                   "dest mac: %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -1235,8 +1121,10 @@ void xdp_prog_done ( xdp_prog_t* prog, int unload, int force_unload )
         return;
     if (prog->m_ip2mac_fd > 0)
         ip2mac_done(prog->m_ip2mac_fd);
+#ifdef ADD_MAP_MANUALLY
     if (unload)
-        detach_ping(prog, 1/*force_unload*/);
+        detach_xdp_obj(prog, 1/*force_unload*/);
+#endif
     if (prog->m_num_socks)
         fprintf(stderr, "%d Sockets remain open!\n", prog->m_num_socks);
     int umem = 0;
@@ -1481,135 +1369,9 @@ int xdp_release_send_buffer(xdp_socket_t *sock, void *buffer)
     return 0;
 }
 
-static void update_header(xdp_socket_t *sock)
-{
-    struct ethhdr *eth;
-
-    DEBUG_MESSAGE("Just updating the header (just addr changes)\n");
-
-    eth = (struct ethhdr *)sock->m_reqs->m_rec.m_header;
-    memcpy(eth->h_dest, &sock->m_reqs->m_mac, sizeof(eth->h_dest));
-
-    if (sock->m_reqs->m_rec.m_ip4)
-    {
-        struct iphdr *iph;
-        memcpy(&sock->m_reqs->m_rec.m_addr.in6_u.u6_addr32[0],
-               &sock->m_reqs->m_sa_in, 4);
-        iph = (struct iphdr *)(eth + 1);
-        iph->daddr = sock->m_reqs->m_sa_in.sin_addr.s_addr;
-    }
-    //TODO
-    //else
-    //    memcpy(&sock->m_reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
-    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
-}
-
-static void rebuild_header(xdp_socket_t *sock, char *pkt,
-                           struct sockaddr *sockaddr)
-{
-    int header_pos;
-
-    sock->m_reqs->m_sendable = 1;
-    sock->m_reqs->m_rec.m_addr_set = 1;
-    sock->m_reqs->m_rec.m_ip4 = ((struct sockaddr_in *)sockaddr)->sin_family == AF_INET;
-    if (sock->m_reqs->m_rec.m_ip4)
-        memcpy(&sock->m_reqs->m_rec.m_addr.in6_u.u6_addr32[0],
-               &((struct sockaddr_in *)sockaddr)->sin_addr, 4);
-    else
-        memcpy(&sock->m_reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
-    // m_port has already been set.
-    sock->m_reqs->m_rec.m_ip_index = sizeof(struct ethhdr);
-    sock->m_reqs->m_rec.m_header_size = xdp_send_udp_headroom(sock);
-    memcpy(sock->m_reqs->m_rec.m_header, pkt, sock->m_reqs->m_rec.m_header_size);
-    DEBUG_MESSAGE("recv, build sendable header %s, raw:\n",
-                  sock->m_reqs->m_rec.m_ip4 ? "ipv4" : "ipv6");
-    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
-    // Reverse the fields where appropriate.
-    memcpy(sock->m_reqs->m_rec.m_header, ((struct ethhdr *)pkt)->h_source,
-           sizeof(((struct ethhdr *)pkt)->h_source));
-    memcpy(((struct ethhdr *)sock->m_reqs->m_rec.m_header)->h_source, pkt,
-           sizeof(((struct ethhdr *)pkt)->h_source));
-    header_pos = sizeof(struct ethhdr);
-    if (sock->m_reqs->m_rec.m_ip4)
-    {
-        struct iphdr *iphdr_save, *iphdr_pkt;
-        iphdr_save = (struct iphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
-        iphdr_pkt = (struct iphdr *)(pkt + header_pos);
-        iphdr_save->saddr = iphdr_pkt->daddr;
-        iphdr_save->daddr = iphdr_pkt->saddr;
-        header_pos += sizeof(struct iphdr);
-    }
-    else
-    {
-        struct ipv6hdr *ipv6hdr_save, *ipv6hdr_pkt;
-        ipv6hdr_save = (struct ipv6hdr *)(sock->m_reqs->m_rec.m_header + header_pos);
-        ipv6hdr_pkt = (struct ipv6hdr *)(pkt + header_pos);
-        memcpy(&ipv6hdr_save->saddr, &ipv6hdr_pkt->daddr, sizeof(struct in6_addr));
-        memcpy(&ipv6hdr_save->daddr, &ipv6hdr_pkt->saddr, sizeof(struct in6_addr));
-        header_pos += sizeof(struct ipv6hdr);
-    }
-    {
-        struct udphdr *udphdr_save, *udphdr_pkt;
-        udphdr_save = (struct udphdr *)(sock->m_reqs->m_rec.m_header + header_pos);
-        udphdr_pkt = (struct udphdr *)(pkt + header_pos);
-        udphdr_save->source = udphdr_pkt->dest;
-        udphdr_save->dest = udphdr_pkt->source;
-        header_pos += sizeof(struct udphdr);
-    }
-    traceBuffer(sock->m_reqs->m_rec.m_header, sock->m_reqs->m_rec.m_header_size);
-}
-
 static int get_remote_info(xdp_socket_t *sock, struct sockaddr *addr)
 {
-    char pkt[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)];
-    struct ethhdr *eth;
-    struct iphdr *iph;
-    ip2mac_data_t data;
-    unsigned char *mac = data.m_mac;
-
-    // TODO Don't forget IP6!
-    if (ip2mac_lookup(sock->m_xdp_prog->m_ip2mac_fd,
-                      ((struct sockaddr_in *)addr)->sin_addr.s_addr, &data))
-    {
-        int err = errno;
-        DEBUG_MESSAGE("Can't lookup address: %s\n", strerror(err));
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "Can't lookup address: %s", strerror(err));
-        errno = err;
-        return -1;
-    }
-    memcpy(&sock->m_reqs->m_sa_in, addr, sizeof(sock->m_reqs->m_sa_in));
-    memcpy(&sock->m_reqs->m_mac, mac, sizeof(sock->m_reqs->m_mac));
-    DEBUG_MESSAGE("Hardware address: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    // TODO: If the address type changes I must rebuild the header as well
-    if (sock->m_reqs->m_sendable)
-    {
-        //printf("Change remote addr to %u.%u.%u.%u\n",
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[0],
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[1],
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[2],
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[3]);
-        update_header(sock);
-    }
-    else
-    {
-        memset(pkt, 0, sizeof(pkt));
-        eth = (struct ethhdr *)pkt;
-        memcpy(eth->h_source, mac, sizeof(eth->h_dest));
-        memcpy(eth->h_dest, sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_mac,
-               sizeof(eth->h_source));
-        eth->h_proto = __constant_htons(ETH_P_IP);
-        iph = (struct iphdr *)(eth + 1);
-        iph->version = 4;
-        iph->ihl = 5;
-        iph->ttl = 20;
-        iph->protocol = 17; // UDP
-        iph->daddr = sock->m_xdp_prog->m_if[sock->m_reqs->m_ifindex].m_sa_in.sin_addr.s_addr;
-        iph->saddr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
-        rebuild_header(sock, pkt, addr);
-    }
-    return 0;
+    return set_reqs(sock->m_xdp_prog, sock->m_reqs, addr);
 }
 
 static int check_send_addr(xdp_socket_t *sock, struct sockaddr *addr)
@@ -1780,11 +1542,6 @@ int xdp_send_zc(xdp_socket_t *sock, void *data, int len, int last,
                 struct sockaddr *addr)
 {
     return x_send(sock, data, len, last, addr, 1);
-}
-
-int xdp_send_udp_headroom(xdp_socket_t *sock)
-{
-    return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
 }
 
 static int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len,
@@ -1971,7 +1728,7 @@ int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr
             continue;
         }
         if (!sock->m_reqs->m_sendable)
-            rebuild_header(sock, pkt, sockaddr);
+            rebuild_header(sock->m_reqs, pkt, sockaddr);
 
         *data = (pkt + header_pos);
         *sz = len - header_pos;
@@ -2034,9 +1791,7 @@ int xdp_add_ip_filter(xdp_socket_t *socket, struct ip_key *ipkey, int shard)
     int value = 0;//socket->m_sock_info->xsk;
     if (socket->m_filter_map == -1)
     {
-        socket->m_filter_map = find_map_fd(socket->m_xdp_prog,
-                                           socket->m_xdp_prog->m_if[socket->m_reqs->m_ifindex].m_bpf_object,
-                                           "ip_key_map");
+        socket->m_filter_map = find_map_fd(socket, "ip_key_map");
         if (socket->m_filter_map == -1)
         {
             DEBUG_MESSAGE("xdp_add_ip_filter can't find map\n");
@@ -2080,5 +1835,12 @@ const char *xdp_get_last_error(xdp_prog_t *prog)
 void xdp_change_in_port ( xdp_socket_t* sock, __u16 port )
 {
     DEBUG_MESSAGE("xdp_change_in_port from %d to %d\n", sock->m_in_port, port);
+    if (!port)
+    {
+        port = sock->m_in_port | __constant_htons(0x8000);
+        DEBUG_MESSAGE("   Change to 0, so set high order on to 0x%x\n",
+                      __constant_htons(port));
+    }
     sock->m_in_port = port;
+    sock->m_reqs->m_port = port;
 }

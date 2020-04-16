@@ -9,7 +9,7 @@
 #define MAX_IF  8
 
 #define XDPSOCK_ETH_LEN 6
-#define MAX_SOCKS       8
+#define MAX_SOCKS       16
 
 #include <linux/in.h>
 #include <linux/if_ether.h>

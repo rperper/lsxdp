@@ -17,7 +17,7 @@ extern "C" {
 #define LSXDP_PRIVATE_MAX_ERR_LEN   256
 
 #define BATCH_SIZE 64
-#define MAX_SOCKS  8
+#define MAX_SOCKS  16
 
 #define DEBUG_HEXDUMP 0
 #define MAC_LEN       6
@@ -27,7 +27,7 @@ extern "C" {
 typedef __u64 u64;
 typedef __u32 u32;
 
-#define MAX_QUEUES 10
+#define MAX_QUEUES 16
 #define MAX_PEEK   16
 
 struct send_bufs_s;
@@ -90,8 +90,10 @@ typedef struct xdp_if_s
     char                    m_ifname[IF_NAMESIZE];
     struct bpf_object      *m_bpf_object;
     int                     m_bpf_prog_fd;
+#ifdef ADD_MAP_MANUALLY
+    int                     m_xsks_map_fd;
+#endif
     int                     m_progfd;
-    int                     m_ping_attached;
     int                     m_socket_attached;
     char                    m_mac[MAC_LEN];
     struct sockaddr_in      m_sa_in;
@@ -110,7 +112,7 @@ typedef struct xdp_prog_s
     int                     m_max_frame_size;
     int                     m_shards;
     int                     m_shard; // 0 for parent or only task.
-    int                     m_child;
+    pid_t                   m_pid_parent;
     int                     m_ip2mac_fd;
     int                     m_send_only;
     __u64                   m_max_memory;
