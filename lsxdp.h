@@ -37,21 +37,43 @@ extern "C" {
 #define LSXDP_MAX_FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
 
 /**
+ * @fn xdp_get_virtio_info
+ * @brief Call to get the virtio_net limits, if any.
+ * @param[in] dev The device name to query.
+ * @param[in] err_len The size of prog_init_err_len
+ * @param[out] err Will return a non-zero first character if there's an error.
+ * @param[out] queues The number of queues if virtio_net.  This defines the
+ *                    number of receives you must post upon if using XDP for
+ *                    receives.
+ * @param[out] cpus The number of cpus if virtio_net.  This defines the maximum
+ *                  number of send queues that can be used.
+ * @returns 1 if virtio could be determined.  0 if not and -1 for an error (see
+ *          err).
+ **/
+int xdp_get_virtio_info(const char *dev, int *queues, int *cpus, char *err,
+                        int err_len);
+
+/**
  * @fn xdp_prog_init
  * @brief Call once when the program starts.  Call xdp_prog_done when completed
  * @param[in] max_frame_size Probably should be hard-coded at 1500
  * @param[in] prog_init_err_len Maximum length of prog_init_err.
  * @param[in] max_memory The maximum amount of memory to be used for packets.
- * @param[in] send_only 1 if this is a send-only program, 0 if it is send and
- *                      receive.
+ * @param[in] send_only Whether to do this for sending or both sending AND
+ *            receiving
  * @param[in] multi_queue 1 if this is a multi-queue program.  At this time it
  *            is required that each socket be on a separate queue for proper
  *            memory management.
  * @param[in] multi_shard 1 if this is a multi-shard program.  For the same
  *            reasons as multi-queue.
+ * @param[in] virtio_dev Non-NULL if you wish to use virtio.  If you specify
+ *            this you must use separate xdp_prog_t definitions for each device.
+ *            You should only specify this if you are going to be multi-queue,
+ *            have shard support, and the number of shards is the number of
+ *            queues.  If specified, max_queues_shards is ignored.
  * @param[in] max_queues_shards Set as a single value so you can't forget that
- *            you can't have multiple queues and shards that are different.
- *            0 if both of the flags above are off.
+ *            you can't have multiple queues and shards that are different
+ *            0 if both of the flags above are off or virtio is on.
  * @param[out] prog_init_err Any errors that should be logged if this function
  *                           returns NULL.
  * @returns A pointer to xdp_prog_t if successful or NULL if an error can be
@@ -59,7 +81,9 @@ extern "C" {
  **/
 xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
                           int max_frame_size, __u64 max_memory, int send_only,
-                          int multi_queue, int multi_shard, int max_queues_shards);
+                          int multi_queue, int multi_shard,
+                          const char *virtio_dev, int max_queues_shards);
+
 /**
  * @fn xdp_get_debug
  * @brief Returns the internal debugging flag.
@@ -255,13 +279,33 @@ void xdp_socket_close(xdp_socket_t *socket);
  * @brief Call to close a socket previously opened with xdp_socket in a child
  *        process where another process is known to own the socket (a parent or
  *        another child).
- * @param[in] xdp_socket_t The socket previously created with xdp_prog_init
+ * @param[in] xdp_socket_t The socket previously created with xdp_socket.
  * @note If you use xdp_socket_close from a child, any other owners of this
  * socket will lose receive access as the eBPF filter map will have its value
  * removed!
  * @returns None
  **/
 void xdp_socket_close_child(xdp_socket_t *socket);
+
+/**
+ * @fn xdp_sockets_get_socket_for_fd
+ * @brief Given an array of sockets and a fd, finds the socket that the
+ *        fd belongs to.
+ * @param[in] socks The array of valid sockets (0..n where n+1 is NULL).
+ * @param[in] fd The file handle to check for.
+ * @returns A pointer to the socket or a NULL if not found.
+ **/
+xdp_socket_t *xdp_sockets_get_socket_for_fd(xdp_socket_t *socks[], int fd);
+
+/**
+ * @fn xdp_sockets_get_socket_for_buf
+ * @brief Given an array of sockets and a buffer, finds the socket that the
+ *        buffer belongs to.
+ * @param[in] socks The array of valid sockets (0..n where n+1 is NULL).
+ * @param[in] buffer A buffer to check for in the array.
+ * @returns A pointer to the socket or a NULL if not found.
+ **/
+xdp_socket_t *xdp_sockets_get_socket_for_buf(xdp_socket_t *socks[], void *buffer);
 
 /**
  * @fn xdp_add_ip_filter

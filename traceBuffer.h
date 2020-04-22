@@ -50,6 +50,8 @@ static void traceBuffer(const char *buf, int sz)
     DEBUG_MESSAGE("Tracing %d bytes:\n%s", sz, buffer);
 #elif defined(TRACE_BUFFER_PRINTF)
     printf("Tracing %d bytes:\n%s", sz, buffer);
+#elif defined(TRACE_BUFFER_LSQ)
+    LSQ_DEBUG("Tracing %d bytes\n%s", sz, buffer);
 #else
     LS_DBG_L("Tracing %d bytes:\n%s", sz, buffer);
 #endif

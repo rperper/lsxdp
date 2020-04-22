@@ -9,7 +9,7 @@
  * If you do not use this mode, libbpf can supply an XDP program for you.
  */
 
-#define USE_PRINTK
+//#define USE_PRINTK
 struct bpf_map_def SEC("maps") xsks_map = {
 	.type        = BPF_MAP_TYPE_XSKMAP,
 	.key_size    = sizeof(int),

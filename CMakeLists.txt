@@ -6,6 +6,7 @@ SET(lsxdp_STAT_SRCS
     bpf_xdp.c
     ip2mac.c
     sendbufs.c
+    virtio_info.c
 )
 
 add_custom_target(xdp_sock_kern ALL
