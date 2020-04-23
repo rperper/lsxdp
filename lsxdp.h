@@ -288,6 +288,17 @@ void xdp_socket_close(xdp_socket_t *socket);
 void xdp_socket_close_child(xdp_socket_t *socket);
 
 /**
+ * @fn xdp_socket_close2
+ * @brief Call to close a socket previously opened with xdp_socket.  Lets you
+ *        specify if you're a child and thus can't really close.
+ * @param[in] xdp_socket_t The socket previously created with xdp_prog_init
+ * @param[in] child 1 if you're a child for sure; 0 if you're a singleton or
+ *                  a parent.
+ * @returns None
+ **/
+void xdp_socket_close2(xdp_socket_t *socket, int child);
+
+/**
  * @fn xdp_sockets_get_socket_for_fd
  * @brief Given an array of sockets and a fd, finds the socket that the
  *        fd belongs to.

@@ -594,7 +594,18 @@ static void x_socket_close( xdp_socket_t* socket, int child )
     }
     DEBUG_MESSAGE("freeing socket\n");
     if (!child)
-        socket->m_xdp_prog->m_num_socks--;
+    {
+        xdp_prog_t *prog = socket->m_xdp_prog;
+        prog->m_num_socks--;
+        if (!prog->m_num_socks &&
+            prog->m_if[socket->m_reqs->m_ifindex].m_socket_attached)
+        {
+            DEBUG_MESSAGE("unload the module now on if #%d\n",
+                          socket->m_reqs->m_ifindex);
+            xdp_link_detach(prog, socket->m_reqs->m_ifindex, 0, 0);
+            prog->m_if[socket->m_reqs->m_ifindex].m_socket_attached = 0;
+        }
+    }
     free(socket);
 }
 
@@ -608,6 +619,12 @@ void xdp_socket_close_child ( xdp_socket_t* socket )
 void xdp_socket_close ( xdp_socket_t* socket )
 {
     x_socket_close(socket, 0);
+}
+
+
+void xdp_socket_close2 ( xdp_socket_t* socket, int child )
+{
+    x_socket_close(socket, child);
 }
 
 
@@ -1171,12 +1188,29 @@ int xdp_get_local_addr(xdp_prog_t *prog,
 
 void xdp_prog_done ( xdp_prog_t* prog, int unload, int force_unload )
 {
+    DEBUG_MESSAGE("xdp_prog_done, prog: %p, unload: %d\n", prog, unload);
     if (!prog)
         return;
     if (prog->m_ip2mac_fd > 0)
         ip2mac_done(prog->m_ip2mac_fd);
     if (prog->m_num_socks)
         fprintf(stderr, "%d Sockets remain open!\n", prog->m_num_socks);
+    if (!prog->m_send_only && unload)
+    {
+        int i;
+        for (i = 1; i < prog->m_max_if; ++i)
+        {
+            if (prog->m_if[i].m_socket_attached)
+            {
+                DEBUG_MESSAGE("xdp_prog_done - unload the module now on if #%d\n",
+                              i);
+                xdp_link_detach(prog, i, 0, 0);
+                prog->m_if[i].m_socket_attached = 0;
+                break;
+            }
+        }
+    }
+
     int queue = 0;
     while (queue < prog->m_max_queues)
     {
