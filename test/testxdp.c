@@ -9,17 +9,24 @@ int inet_aton(const char *cp, struct in_addr *inp);
 
 void usage()
 {
-    printf("Usage: testxdp [-beinopw]\n");
+    printf("Usage: testxdp [-behimnopQrsSvwx]\n");
     printf("Where:\n");
     printf("   -b <addr> Optional parameter of local IP addr to bind on during discovery\n");
     printf("   -d Turns on debugging\n");
     printf("   -e <interface name> allows you to specify 1 interface name\n");
+    printf("   -h Turns on Hardware XDP (DRV mode)\n");
     printf("   -i <addr> to connect to\n");
+    printf("   -m <max memory> maximum amount of memory for all packets\n");
     printf("   -n is to NOT unload after initializing\n");
     printf("   -o is to unload ONLY (no initialization)\n");
     printf("   -p <port> is to set the port to connect to\n");
+    printf("   -Q to turn on MULTI-QUEUE\n");
     printf("   -r is to receive ONLY (no send - wait until [ENTER]\n");
+    printf("   -s to turn on SEND-ONLY\n");
+    printf("   -S to turn on MULTI-SHARD\n");
+    printf("   -v to turn on VIRT-IO (you must specify -e)\n");
     printf("   -w is to wait for an ENTER after loading\n");
+    printf("   -x <max> max queues/shards\n");
 }
 
 
@@ -176,15 +183,22 @@ int main(int argc, char **argv)
     int              unload_only = 0;
     int              unload = 1;
     int              pause = 0;
+    __u64            max_memory = 0;
     char            *ifn = NULL;
     char            *addr = "127.0.0.1";
     char            *port = "80";
     char            *addr_bin = NULL;
     char             recv_only = 0;
+    int              send_only = 0;
+    int              multi_queue = 0;
+    int              multi_shard = 0;
+    int              max_queues_shards = 0;
+    int              virtio = 0;
+    int              hardware = 0;
     struct sockaddr_in6 sa_comm;
 
     memset(&sa_comm, 0, sizeof(sa_comm));
-    while ((opt = getopt(argc, argv, "b:de:i:nop:rw")) != -1)
+    while ((opt = getopt(argc, argv, "b:de:hi:m:nop:QrSsvwx:")) != -1)
     {
         switch (opt)
         {
@@ -198,8 +212,14 @@ int main(int argc, char **argv)
             case 'e':
                 ifn = strdup(optarg);
                 break;
+            case 'h':
+                hardware = 1;
+                break;
             case 'i':
                 addr = strdup(optarg);
+                break;
+            case 'm':
+                max_memory = atoi(optarg);
                 break;
             case 'n':
                 unload = 0;
@@ -211,11 +231,26 @@ int main(int argc, char **argv)
             case 'p':
                 port = strdup(optarg);
                 break;
+            case 'Q':
+                multi_queue = 1;
+                break;
             case 'r':
                 recv_only = 1;
                 break;
+            case 's':
+                send_only = 1;
+                break;
+            case 'S':
+                multi_shard = 1;
+                break;
+            case 'v':
+                virtio = 1;
+                break;
             case 'w':
                 pause = 1;
+                break;
+            case 'x':
+                max_queues_shards = atoi(optarg);
                 break;
             default:
                 usage();
@@ -223,7 +258,9 @@ int main(int argc, char **argv)
         }
     }
     printf("Calling xdp_prog_init\n");
-    prog = xdp_prog_init(msg, msg_len, 1500);
+    prog = xdp_prog_init(msg, msg_len, 1500, max_memory, send_only, multi_queue,
+                         multi_shard, virtio ? ifn : NULL, max_queues_shards,
+                         hardware);
     if (!prog)
     {
         printf("ERROR in xdp_prog_init: %s\n", msg);
@@ -268,7 +305,7 @@ int main(int argc, char **argv)
                 printf("Press [ENTER] to continue... ->");
                 fgets(input, sizeof(input), stdin);
             }
-            sock = xdp_socket(prog, reqs, htons(atoi(port)), 0, 0);
+            sock = xdp_socket(prog, reqs, htons(atoi(port)), 0);
             if (!sock)
             {
                 ret = -1;

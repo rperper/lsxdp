@@ -59,6 +59,7 @@ int xdp_get_virtio_info(const char *dev, int *queues, int *cpus, char *err,
  * @param[in] max_frame_size Probably should be hard-coded at 1500
  * @param[in] prog_init_err_len Maximum length of prog_init_err.
  * @param[in] max_memory The maximum amount of memory to be used for packets.
+ *                       If not specified (0) 16MB will be used.
  * @param[in] send_only Whether to do this for sending or both sending AND
  *            receiving
  * @param[in] multi_queue 1 if this is a multi-queue program.  At this time it
@@ -74,6 +75,8 @@ int xdp_get_virtio_info(const char *dev, int *queues, int *cpus, char *err,
  * @param[in] max_queues_shards Set as a single value so you can't forget that
  *            you can't have multiple queues and shards that are different
  *            0 if both of the flags above are off or virtio is on.
+ * @param[in] hardware_xdp Set if you wish to turn on the hardware socket
+ *            flag.
  * @param[out] prog_init_err Any errors that should be logged if this function
  *                           returns NULL.
  * @returns A pointer to xdp_prog_t if successful or NULL if an error can be
@@ -82,7 +85,8 @@ int xdp_get_virtio_info(const char *dev, int *queues, int *cpus, char *err,
 xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
                           int max_frame_size, __u64 max_memory, int send_only,
                           int multi_queue, int multi_shard,
-                          const char *virtio_dev, int max_queues_shards);
+                          const char *virtio_dev, int max_queues_shards,
+                          int hardware);
 
 /**
  * @fn xdp_get_debug
@@ -105,7 +109,7 @@ void xdp_debug(int on);
  * @param[in] reqs The required information to setup a socket.  Use
  *                 xdp_get_socket_reqs to obtain this info and leave it
  *                 allocated through the life of this socket.
- * @param[in] port The port to use for UDP traffic.
+ * @param[in] port The port to use for UDP traffic in host order.
  * @param[in] queue The 0 based queue number
  * @returns A pointer to xdp_socket_t if successful and NULL if an error can be
  *          reported.
@@ -350,7 +354,7 @@ int xdp_get_shard(xdp_prog_t *prog);
  * @brief If you've created your socket, but need to change the listening port
  *        (for UDP receives for example), do it here.
  * @param[in] sock The socket structure.
- * @param[in] port The port to now use.
+ * @param[in] port The port to now use (in host order).
  * @returns None.
  **/
 void xdp_change_in_port(xdp_socket_t *sock, __u16 port);

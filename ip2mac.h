@@ -13,7 +13,7 @@ typedef struct ip2mac_data_s
 } ip2mac_data_t;
 
 int ip2mac_init(int max);
-int ip2mac_lookup(int fd, __u32 addr, ip2mac_data_t *data);
+int ip2mac_lookup(int fd, char *ifn, int ifi, __u32 addr, ip2mac_data_t *data);
 int ip2mac_done(int fd);
 #ifdef __cplusplus
 }

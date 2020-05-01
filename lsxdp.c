@@ -57,7 +57,7 @@ static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | // Does a force if not 
 static __u16 opt_xdp_bind_flags = /*XDP_SHARED_UMEM |*/ //?
                                   /* XDP_COPY | // Force copy mode */
                                   /* XDP_ZEROCOPY | // Force zero copy */
-                                  0;/*XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
+                                  0;//XDP_USE_NEED_WAKEUP;// For same cpu for force yield*/
 
 static u32 max_send(xdp_prog_t *prog, int queue)
 {
@@ -234,7 +234,7 @@ static int xsk_configure_socket(xdp_socket_t *sock)
                       cfg.tx_size * prog->m_send_shards);
         cfg.tx_size *= prog->m_send_shards;
     }
-    cfg.libbpf_flags = (prog->m_multi_queue || !prog->m_if[ifindex].m_socket_attached) ? 0 : XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+    cfg.libbpf_flags = (prog->m_multi_queue || prog->m_send_only || !prog->m_if[ifindex].m_socket_attached) ? 0 : XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = opt_xdp_bind_flags/* | child ? XDP_SHARED_UMEM : 0*/;
     DEBUG_MESSAGE("xsk_socket__create queue: %d, libbpf_flags: "
@@ -449,7 +449,8 @@ static int get_ifs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *prog)
 xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
                           int max_frame_size, __u64 max_memory, int send_only,
                           int multi_queue, int multi_shard,
-                          const char *virtio_dev, int max_queues_shards)
+                          const char *virtio_dev, int max_queues_shards,
+                          int hardware)
 {
     struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
     int ret;
@@ -522,6 +523,9 @@ xdp_prog_t *xdp_prog_init(char *prog_init_err, int prog_init_err_len,
         else
             prog->m_max_queues = 1;
         prog->m_send_shards = prog->m_shards ? prog->m_shards : 1;
+        prog->m_hardware = hardware;
+        if (hardware)
+            opt_xdp_flags |= (/*XDP_FLAGS_SKB_MODE | */XDP_FLAGS_DRV_MODE/* | XDP_FLAGS_HW_MODE*/);
     }
     prog->m_umem = mmap(NULL, sizeof(struct xsk_umem_info) * prog->m_max_queues,
                         PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
@@ -600,10 +604,13 @@ static void x_socket_close( xdp_socket_t* socket, int child )
         if (!prog->m_num_socks &&
             prog->m_if[socket->m_reqs->m_ifindex].m_socket_attached)
         {
-            DEBUG_MESSAGE("unload the module now on if #%d\n",
-                          socket->m_reqs->m_ifindex);
-            xdp_link_detach(prog, socket->m_reqs->m_ifindex, 0, 0);
-            prog->m_if[socket->m_reqs->m_ifindex].m_socket_attached = 0;
+            /* NOTE: If I unload the module in virtio, I can't seem to rebind
+             * to queues > number of CPUs!  Don't know why, but can't do
+             * anything to fix it other than this.  */
+            //DEBUG_MESSAGE("unload the module now on if #%d\n",
+            //              socket->m_reqs->m_ifindex);
+            //xdp_link_detach(prog, socket->m_reqs->m_ifindex, 0, 0);
+            //prog->m_if[socket->m_reqs->m_ifindex].m_socket_attached = 0;
         }
     }
     free(socket);
@@ -1024,11 +1031,20 @@ static void rebuild_header(lsxdp_socket_reqs_t *reqs, char *pkt,
     reqs->m_rec.m_addr_set = 1;
     reqs->m_rec.m_ip4 = ((struct sockaddr_in *)sockaddr)->sin_family == AF_INET;
     if (reqs->m_rec.m_ip4)
+    {
         memcpy(&reqs->m_rec.m_addr.in6_u.u6_addr32[0],
                &((struct sockaddr_in *)sockaddr)->sin_addr, 4);
+        reqs->m_sa_in.sin_addr.s_addr = ((struct sockaddr_in *)sockaddr)->sin_addr.s_addr;
+    }
     else
-        memcpy(&reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
+    {
+        memcpy(&reqs->m_rec.m_addr, &((struct sockaddr_in6 *)sockaddr)->sin6_addr,
+               sizeof(struct in6_addr));
+        /* IP6 TODO */
+    }
     // m_port has already been set.
+    memcpy(reqs->m_mac, ((struct ethhdr *)pkt)->h_source,
+           sizeof(((struct ethhdr *)pkt)->h_source));
     reqs->m_rec.m_ip_index = sizeof(struct ethhdr);
     reqs->m_rec.m_header_size = send_udp_headroom();
     memcpy(reqs->m_rec.m_header, pkt, reqs->m_rec.m_header_size);
@@ -1081,7 +1097,8 @@ static int set_reqs(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
     unsigned char *mac = data.m_mac;
 
     // TODO Don't forget IP6!
-    if (ip2mac_lookup(prog->m_ip2mac_fd,
+    if (ip2mac_lookup(prog->m_ip2mac_fd, prog->m_if[reqs->m_ifindex].m_ifname,
+                      reqs->m_ifindex,
                       ((struct sockaddr_in *)addr)->sin_addr.s_addr, &data))
     {
         int err = errno;
@@ -1471,7 +1488,6 @@ static int check_send_addr(xdp_socket_t *sock, struct sockaddr *addr)
          ((struct sockaddr_in *)addr)->sin_addr.s_addr == sock->m_reqs->m_sa_in.sin_addr.s_addr))
         // Use the one in cache
         return 0;
-
     DEBUG_MESSAGE("check_send_addr: family: %u addr: %u.%u.%u.%u port: %d\n",
                   ((struct sockaddr_in *)addr)->sin_family,
                   ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[0],
@@ -1936,9 +1952,13 @@ void xdp_change_in_port ( xdp_socket_t* sock, __u16 port )
     DEBUG_MESSAGE("xdp_change_in_port from %d to %d\n", sock->m_in_port, port);
     if (!port)
     {
-        port = sock->m_in_port | __constant_htons(0x8000);
-        DEBUG_MESSAGE("   Change to 0, so set high order on to 0x%x\n",
-                      __constant_htons(port));
+#define MIN_PORT 49152
+#define MAX_PORT 65535
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        port = __constant_htons((ts.tv_nsec % (MAX_PORT - MIN_PORT)) + MIN_PORT);
+        DEBUG_MESSAGE("   Change to 0, so force random port to 0x%x (%d)\n",
+                      __constant_htons(port), __constant_htons(port));
     }
     sock->m_in_port = port;
     sock->m_reqs->m_port = port;

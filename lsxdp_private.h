@@ -115,6 +115,7 @@ typedef struct xdp_prog_s
     int                     m_virtio_cpus;
     int                     m_send_shards;
     const char             *m_virtio_ifname;
+    int                     m_hardware;
 } xdp_prog_t;
 
 

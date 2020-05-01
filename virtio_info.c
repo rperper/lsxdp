@@ -162,7 +162,16 @@ int xdp_get_virtio_info(const char *dev, int *queues, int *cpus, char *err_msg,
     {
         if (!get_cpus(dev, cpus, err_msg, err_len) &&
             !get_queues(dev, queues, err_msg, err_len))
+        {
+            if (*queues > 2 * *cpus)
+            {
+                DEBUG_MESSAGE("For now if the (number of queues) is > 2 * "
+                              "(number of CPUs) use 2 * (number of CPUs) as "
+                              "(number of queues) -> %d\n", 2 * *cpus);
+                *queues = 2 * *cpus;
+            }
             return 1;
+        }
         return -1;
     }
     return rc;

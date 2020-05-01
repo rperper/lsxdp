@@ -64,6 +64,15 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     bpf_printk("sock_prog ports: %d %d\n", bpf_htons(udphdr->source),
                bpf_htons(udphdr->dest));
 #endif
+    if (bpf_htons(udphdr->source) < 1024 &&
+        bpf_htons(udphdr->source) != 80 &&
+        bpf_htons(udphdr->source) != 443)
+    {
+#ifdef USE_PRINTK
+        bpf_printk("reserved port: %u\n", bpf_htons(udphdr->dest));
+#endif
+        goto out;
+    }
     af_xdp = 1;
 out:
     if (!af_xdp)
