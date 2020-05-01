@@ -44,6 +44,7 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     }
     else if (h_proto == bpf_htons(ETH_P_IPV6))
     {
+        // TODO IPv6
 		goto out;
     }
     else

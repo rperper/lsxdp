@@ -4,7 +4,7 @@ SET(testxdp_STAT_SRCS
     testxdp.c
 )
 
-set (libs lsxdp libbpf.a elf z)
+set (libs lsxdp elf z)
 include_directories(libbpf)
 include_directories(libbpf/src)
 include_directories(libbpf/include/uapi)

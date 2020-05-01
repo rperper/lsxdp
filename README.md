@@ -13,8 +13,15 @@ git submodule init
 git submodule update
 ```
 
+
 Building the library
 --------------------
+You will need to make libbpf.  From the lsxdp directory:
+```
+cd libbpf/src
+make
+```
+Then you can build liblsxdp:
 ```
 cmake .
 make
@@ -23,6 +30,10 @@ make
 Using the library
 -----------------
 See the test program test/testxdp.c for an example.  You should be able to compile it.  But MUCH more comprehensive testing can be done in the LSQUIC programs http_server and http_client.  At this time you need to use the latest `xdp` branch to get support.
+
+Besides the liblsxdp.a static library, you must also link your program with libelf and libz (-lelf, -lz).  
+
+xdpsock_kern.o needs to be in the same directory as your program as it gets loaded at run-time.
 
 The xdp and QUIC code has been heavily modified to best support the virtio-net driver used with most VMs.  While you can use other drivers, the best speed is with virtio-net.  However, you need to have the number of CPUs be less than the number of queues hardcoded into the driver.  My experience so far seems that 4 is the best.  Note that you need to listen on ALL queues with that driver, which means you need to use the -V option in http_server to accept requests.
 
