@@ -1179,7 +1179,7 @@ static int set_reqs(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
     memcpy(&reqs->m_mac, mac, sizeof(reqs->m_mac));
     DEBUG_MESSAGE("Hardware address: %02x:%02x:%02x:%02x:%02x:%02x\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    // TODO: If the address type changes I must rebuild the header as well
+    // Thought: If the address type changes I must rebuild the header as well
     if (reqs->m_sendable)
     {
         update_header(reqs);
@@ -1624,6 +1624,37 @@ static unsigned short ipv6_udp_checksum(char *buffer, int data_len)
 }
 
 
+static unsigned short ipv4_udp_checksum(char *buffer, int data_len)
+{
+    /* Note that the pseudo header is 8 bytes shorter than the real header! */
+    struct ipv4_pseudo_header
+    {
+        unsigned char saddr[4];
+        unsigned char daddr[4];
+        unsigned char zeros;
+        unsigned char protocol;
+        unsigned char udp_length[2];
+    };
+    struct ipv4_pseudo_header *pheader = (struct ipv4_pseudo_header *)&buffer[sizeof(struct iphdr) - sizeof(struct ipv4_pseudo_header)];
+    struct iphdr   save_hdr;
+    struct iphdr  *iph = (struct iphdr *)&save_hdr;
+    unsigned short check;
+
+    memcpy(&save_hdr, buffer, sizeof(save_hdr));
+    DEBUG_MESSAGE("Generating ipv4_udp_checksum\n");
+    traceBuffer((const char *)&save_hdr, sizeof(save_hdr));
+    *(uint32_t *)pheader->saddr = iph->saddr;
+    *(uint32_t *)pheader->daddr = iph->daddr;
+    pheader->zeros = 0;
+    pheader->protocol = save_hdr.protocol;
+    *(__u16 *)pheader->udp_length = __constant_htonl(data_len + 8);
+    check = checksum(&buffer[sizeof(struct iphdr) - sizeof(struct ipv4_pseudo_header)],
+                     sizeof(*pheader) + 8 + data_len);
+    memcpy(buffer, &save_hdr, sizeof(save_hdr));
+    return check;
+}
+
+
 static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
                      struct sockaddr_storage *addr)
 {
@@ -1680,6 +1711,8 @@ static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
     udphdr->check = 0;
     if (!sock->m_reqs->m_rec.m_ip4)
         udphdr->check = ipv6_udp_checksum(&((char *)buffer)[ip_index], len);
+    else
+        udphdr->check = ipv4_udp_checksum(&((char *)buffer)[ip_index], len);
     return tx_only(sock, buffer, len + headroom, last);
 }
 
