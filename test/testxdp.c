@@ -71,11 +71,11 @@ int do_send(xdp_prog_t *prog, xdp_socket_t *sock, struct sockaddr_in6 *sa)
             strcpy(send_buffer, "Test string!");
             strcpy(send_buffer2, "The second send buffer.");
             ret = xdp_send(sock, send_buffer, strlen(send_buffer), 0,
-                           (struct sockaddr *)sa);
+                           (struct sockaddr_storage *)sa);
             if (ret)
                 printf("Error sending send_buffer: %s\n", xdp_get_last_error(prog));
             else if ((ret = xdp_send(sock, send_buffer2, strlen(send_buffer2), 1,
-                                     (struct sockaddr *)sa)))
+                                     (struct sockaddr_storage *)sa)))
                 printf("Error sending send_buffer2: %s\n", xdp_get_last_error(prog));
             else
             {
@@ -146,7 +146,8 @@ int do_recv(xdp_prog_t *prog, xdp_socket_t *sock, struct sockaddr_in6 *sa)
             socklen_t sa_len = sizeof(*sa);
             int sz;
             printf("\nPoll successful (ret: %d), doing receive\n", ret);
-            ret = xdp_recv(sock, &buffer, &sz, (struct sockaddr *)sa, &sa_len);
+            ret = xdp_recv(sock, &buffer, &sz, (struct sockaddr_storage *)sa,
+                           &sa_len);
             if (ret < 0)
             {
                 printf("Error in xdp_recv: %s\n", xdp_get_last_error(prog));
@@ -288,8 +289,9 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
-        reqs = xdp_get_socket_reqs(prog, (struct sockaddr *)&sa, sizeof(sa),
-                                   (struct sockaddr *)(!recv_only ? &sa_bind : NULL),
+        reqs = xdp_get_socket_reqs(prog, (struct sockaddr_storage *)&sa,
+                                   sizeof(sa),
+                                   (struct sockaddr_storage *)(!recv_only ? &sa_bind : NULL),
                                    ifn);
         if (!reqs)
         {

@@ -143,9 +143,9 @@ xdp_socket_t *xdp_socket(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs, int port,
  * return. If it's integrated, there will need to be event handling done!
  **/
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
-                                         const struct sockaddr *addr,
+                                         const struct sockaddr_storage *addr,
                                          socklen_t addrLen,
-                                         const struct sockaddr *addr_bind,
+                                         const struct sockaddr_storage *addr_bind,
                                          const char *ifport);
 /**
  * @fn xdp_get_local_addr
@@ -159,7 +159,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
 int xdp_get_local_addr(xdp_prog_t *prog,
                        lsxdp_socket_reqs_t *reqs,
                        int ipv4,
-                       struct sockaddr *addr);
+                       struct sockaddr_storage *addr);
 
 /**
  * @fn xdp_get_poll_fd
@@ -205,7 +205,7 @@ int xdp_release_send_buffer(xdp_socket_t *sock, void *buffer);
  * @returns -1 for an error or 0 for success.
  **/
 int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
-             struct sockaddr *addr);
+             struct sockaddr_storage *addr);
 
 /**
  * @fn xdp_send_zc
@@ -222,7 +222,7 @@ int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
  * @returns -1 for an error or 0 for success.
  **/
 int xdp_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
-                struct sockaddr *addr);
+                struct sockaddr_storage *addr);
 
 /**
  * @fn xdp_send_completed
@@ -258,8 +258,8 @@ int xdp_send_udp_headroom(xdp_socket_t *sock);
  * @note You MUST call poll before calling this function.
  * @note You MUST return the received buffer with xdp_recv_return
  **/
-int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *addr,
-             socklen_t *addrlen);
+int xdp_recv(xdp_socket_t *sock, void **data, int *sz,
+             struct sockaddr_storage *addr, socklen_t *addrlen);
 
 /**
  * @fn xdp_recv_return

@@ -133,6 +133,52 @@ int xdp_get_debug(void)
 }
 
 
+#define MAX_STR_SOCKADDR    42
+char *str_sockaddr(struct sockaddr_storage *addr, char *str, int str_size)
+{
+    if (addr->ss_family == AF_INET)
+        snprintf(str, str_size, "%u.%u.%u.%u",
+                 ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[0],
+                 ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[1],
+                 ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[2],
+                 ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[3]);
+    else if (addr->ss_family == AF_INET6)
+    {
+        struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)addr;
+        int i;
+        int in_zeros = 0;
+        int was_zeros = 0;
+        char *strp = str;
+        int chars;
+        for (i = 0; i < 8; ++i)
+        {
+            if (addr6->sin6_addr.in6_u.u6_addr16[i] == 0)
+            {
+                if (!was_zeros)
+                {
+                    ++in_zeros;
+                    continue;
+                }
+            }
+            else if (in_zeros)
+            {
+                ++was_zeros;
+                *strp++ = ':';
+                *strp = 0;
+                in_zeros = 0;
+            }
+            chars = snprintf(strp, str_size - (int)(strp - str), "%s%x",
+                             (i == 0) ? "" : ":",
+                             __constant_htons(addr6->sin6_addr.in6_u.u6_addr16[i]));
+            strp += chars;
+        }
+    }
+    else
+        snprintf(str, str_size, "Unexpected family type: %d", addr->ss_family);
+    return str;
+}
+
+
 static int xsk_configure_umem(xdp_prog_t *prog, struct xsk_umem_info *umem,
                               int queue, u64 size)
 {
@@ -366,6 +412,7 @@ static int get_addrs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *pro
         {
             if (!(strcmp(prog->m_if[i].m_ifname, ifa->ifa_name)))
             {
+                char str_ip[MAX_STR_SOCKADDR];
                 if (prog->m_if[i].m_disable)
                 {
                     DEBUG_MESSAGE("Ignore addrs for disabled if: %s\n",
@@ -374,21 +421,21 @@ static int get_addrs(char *prog_init_err, int prog_init_err_len, xdp_prog_t *pro
                 }
                 if (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET)
                 {
+                    prog->m_if[i].m_sa_in.sin_family = AF_INET;
                     memcpy(&prog->m_if[i].m_sa_in, ifa->ifa_addr,
                            sizeof(prog->m_if[i].m_sa_in));
-                    DEBUG_MESSAGE("%s is ipv4: %u.%u.%u.%u\n", ifa->ifa_name,
-                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[0],
-                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[1],
-                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[2],
-                                  ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[3]);
-                    break;
+                    DEBUG_MESSAGE("%s is ipv4: %s\n", ifa->ifa_name,
+                                  str_sockaddr((struct sockaddr_storage *)ifa->ifa_addr,
+                                               str_ip, MAX_STR_SOCKADDR));
                 }
                 else if (((struct sockaddr_in *)ifa->ifa_addr)->sin_family == AF_INET6)
                 {
+                    prog->m_if[i].m_sa_in6.sin6_family = AF_INET6;
                     memcpy(&prog->m_if[i].m_sa_in6, ifa->ifa_addr,
                            sizeof(prog->m_if[i].m_sa_in6));
-                    DEBUG_MESSAGE("%s is ipv6\n", ifa->ifa_name);
-                    break;
+                    DEBUG_MESSAGE("%s is ipv6: %s (index: %d)\n", ifa->ifa_name,
+                                  str_sockaddr((struct sockaddr_storage *)&prog->m_if[i].m_sa_in6,
+                                               str_ip, MAX_STR_SOCKADDR), i);
                 }
             }
         }
@@ -813,37 +860,33 @@ xdp_socket_t* xdp_socket(xdp_prog_t* prog, lsxdp_socket_reqs_t* reqs, int port,
 
 
 static int addr_bind_to_ifport(xdp_prog_t *prog,
-                               const struct sockaddr *addr_bind,
+                               const struct sockaddr_storage *addr_bind,
                                char ifport[])
 {
     int i;
     ifport[0] = 0;
-    if (!addr_bind || !addr_bind->sa_family)
+    if (!addr_bind || !addr_bind->ss_family)
     {
         DEBUG_MESSAGE("addr_bind_to_ifport NO addr_bind specified\n");
         return 0;
     }
     for (i = 1; i <= prog->m_max_if; ++i)
     {
-        if ((addr_bind->sa_family == AF_INET &&
+        if ((addr_bind->ss_family == AF_INET &&
              prog->m_if[i].m_sa_in.sin_family == AF_INET &&
              ((struct sockaddr_in *)addr_bind)->sin_addr.s_addr == prog->m_if[i].m_sa_in.sin_addr.s_addr) ||
-            (addr_bind->sa_family == AF_INET6 &&
+            (addr_bind->ss_family == AF_INET6 &&
              prog->m_if[i].m_sa_in6.sin6_family == AF_INET6 &&
              ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[0] &&
-             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[1] &&
-             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[2] &&
-             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[0] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[3]))
+             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[1] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[1] &&
+             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[2] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[2] &&
+             ((struct sockaddr_in6 *)addr_bind)->sin6_addr.in6_u.u6_addr32[3] == prog->m_if[i].m_sa_in6.sin6_addr.in6_u.u6_addr32[3]))
         {
-            if (addr_bind->sa_family == AF_INET)
-                DEBUG_MESSAGE("Found addr_bind addr %u.%u.%u.%u on %s\n",
-                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[0],
-                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[1],
-                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[2],
-                              ((unsigned char *)&((struct sockaddr_in *)addr_bind)->sin_addr.s_addr)[3],
-                              prog->m_if[i].m_ifname);
-            else
-                DEBUG_MESSAGE("Found addr_bind addr (v6) on %s\n", prog->m_if[i].m_ifname);
+            char str_ip[MAX_STR_SOCKADDR];
+            DEBUG_MESSAGE("Found addr_bind addr: %s on %s\n",
+                          str_sockaddr((struct sockaddr_storage *)addr_bind,
+                                       str_ip, sizeof(str_ip)),
+                          prog->m_if[i].m_ifname);
             strcpy(ifport, prog->m_if[i].m_ifname);
             break;
         }
@@ -861,7 +904,7 @@ static int addr_bind_to_ifport(xdp_prog_t *prog,
 static int ifport_to_addr_bind(xdp_prog_t *prog,
                                const char ifport[],
                                int ipv4,
-                               struct sockaddr *addr_bind)
+                               struct sockaddr_storage *addr_bind)
 {
     int i;
     DEBUG_MESSAGE("ifport_to_addr_bind, port: %s, %s\n", ifport,
@@ -871,16 +914,14 @@ static int ifport_to_addr_bind(xdp_prog_t *prog,
     {
         if (!(strcmp(ifport, prog->m_if[i].m_ifname)))
         {
+            char str_ip[MAX_STR_SOCKADDR];
             if (ipv4 &&
                 prog->m_if[i].m_sa_in.sin_family == AF_INET)
             {
                 memcpy(addr_bind, &prog->m_if[i].m_sa_in,
                        sizeof(struct sockaddr_in));
-                DEBUG_MESSAGE("Addr for port %s is %u.%u.%u.%u\n", ifport,
-                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[0],
-                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[1],
-                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[2],
-                              ((unsigned char *)&prog->m_if[i].m_sa_in.sin_addr.s_addr)[3]);
+                DEBUG_MESSAGE("Addr for port %s is %s\n", ifport,
+                              str_sockaddr(addr_bind, str_ip, MAX_STR_SOCKADDR));
                 break;
             }
             if (!ipv4 &&
@@ -888,6 +929,8 @@ static int ifport_to_addr_bind(xdp_prog_t *prog,
             {
                 memcpy(addr_bind, &prog->m_if[i].m_sa_in6,
                        sizeof(struct sockaddr_in6));
+                DEBUG_MESSAGE("Addr for port %s is %s\n", ifport,
+                              str_sockaddr(addr_bind, str_ip, MAX_STR_SOCKADDR));
                 break;
             }
         }
@@ -903,7 +946,8 @@ static int ifport_to_addr_bind(xdp_prog_t *prog,
 
 
 static int check_if(xdp_prog_t *prog, const char *ifport,
-                    const struct sockaddr *addr_bind, int *enabled_ifindex)
+                    const struct sockaddr_storage *addr_bind,
+                    int *enabled_ifindex)
 {
     int i;
     int enabled_one = 0;
@@ -999,31 +1043,47 @@ static void update_header(lsxdp_socket_reqs_t *reqs)
     {
         struct iphdr *iph;
         memcpy(&reqs->m_rec.m_addr.in6_u.u6_addr32[0],
-               &reqs->m_sa_in, 4);
+               &reqs->m_sa_in.sin_addr, 4);
         iph = (struct iphdr *)(eth + 1);
         iph->daddr = reqs->m_sa_in.sin_addr.s_addr;
     }
-    //TODO
-    //else
-    //    memcpy(&reqs->m_rec.m_addr, sockaddr, sizeof(struct in6_addr));
+    else
+    {
+        struct ipv6hdr *ip6h;
+        memcpy(&reqs->m_rec.m_addr, &reqs->m_sa_in6.sin6_addr,
+               sizeof(struct in6_addr));
+        ip6h = (struct ipv6hdr *)(eth + 1);
+        memcpy(&ip6h->daddr, &reqs->m_sa_in6.sin6_addr, sizeof(ip6h->daddr));
+    }
     traceBuffer(reqs->m_rec.m_header, reqs->m_rec.m_header_size);
 }
 
 
-static int send_udp_headroom(void)
+static int send_udp_headroom(struct sockaddr_storage *sa)
 {
-    return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
+    if (sa->ss_family == AF_INET)
+    {
+        DEBUG_MESSAGE("Headroom for ipv4: %d\n", sizeof(struct ethhdr) +
+                      sizeof(struct iphdr) + sizeof(struct udphdr));
+        return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
+    }
+    DEBUG_MESSAGE("Headroom for ipv6: %d (family: %d)\n", sizeof(struct ethhdr) +
+                  sizeof(struct ipv6hdr) + sizeof(struct udphdr), sa->ss_family);
+    return sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct udphdr);
+
 }
 
 
 int xdp_send_udp_headroom(xdp_socket_t *sock)
 {
-    return send_udp_headroom();
+    return send_udp_headroom((sock->m_reqs->m_rec.m_ip4) ?
+                                (struct sockaddr_storage *)&sock->m_reqs->m_sa_in :
+                                (struct sockaddr_storage *)&sock->m_reqs->m_sa_in6);
 }
 
 
 static void rebuild_header(lsxdp_socket_reqs_t *reqs, char *pkt,
-                           struct sockaddr *sockaddr)
+                           struct sockaddr_storage *sockaddr)
 {
     int header_pos;
 
@@ -1034,19 +1094,24 @@ static void rebuild_header(lsxdp_socket_reqs_t *reqs, char *pkt,
     {
         memcpy(&reqs->m_rec.m_addr.in6_u.u6_addr32[0],
                &((struct sockaddr_in *)sockaddr)->sin_addr, 4);
+        reqs->m_sa_in.sin_family = AF_INET;
         reqs->m_sa_in.sin_addr.s_addr = ((struct sockaddr_in *)sockaddr)->sin_addr.s_addr;
+        //reqs->m_port = ((struct sockaddr_in *)sockaddr)->sin_port;
     }
     else
     {
         memcpy(&reqs->m_rec.m_addr, &((struct sockaddr_in6 *)sockaddr)->sin6_addr,
                sizeof(struct in6_addr));
-        /* IP6 TODO */
+        reqs->m_sa_in6.sin6_family = AF_INET6;
+        memcpy(&reqs->m_sa_in6.sin6_addr,
+               &((struct sockaddr_in6 *)sockaddr)->sin6_addr,
+               sizeof(struct in6_addr));
+        //reqs->m_port = ((struct sockaddr_in6 *)sockaddr)->sin6_port;
     }
-    // m_port has already been set.
     memcpy(reqs->m_mac, ((struct ethhdr *)pkt)->h_source,
            sizeof(((struct ethhdr *)pkt)->h_source));
     reqs->m_rec.m_ip_index = sizeof(struct ethhdr);
-    reqs->m_rec.m_header_size = send_udp_headroom();
+    reqs->m_rec.m_header_size = send_udp_headroom(sockaddr);
     memcpy(reqs->m_rec.m_header, pkt, reqs->m_rec.m_header_size);
     DEBUG_MESSAGE("recv, build sendable header %s, raw:\n",
                   reqs->m_rec.m_ip4 ? "ipv4" : "ipv6");
@@ -1071,6 +1136,9 @@ static void rebuild_header(lsxdp_socket_reqs_t *reqs, char *pkt,
         struct ipv6hdr *ipv6hdr_save, *ipv6hdr_pkt;
         ipv6hdr_save = (struct ipv6hdr *)(reqs->m_rec.m_header + header_pos);
         ipv6hdr_pkt = (struct ipv6hdr *)(pkt + header_pos);
+        ipv6hdr_save->flow_lbl[0] = 0;
+        ipv6hdr_save->flow_lbl[1] = 0;
+        ipv6hdr_save->flow_lbl[2] = 0;
         memcpy(&ipv6hdr_save->saddr, &ipv6hdr_pkt->daddr, sizeof(struct in6_addr));
         memcpy(&ipv6hdr_save->daddr, &ipv6hdr_pkt->saddr, sizeof(struct in6_addr));
         header_pos += sizeof(struct ipv6hdr);
@@ -1088,18 +1156,14 @@ static void rebuild_header(lsxdp_socket_reqs_t *reqs, char *pkt,
 
 
 static int set_reqs(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
-                    struct sockaddr *addr)
+                    struct sockaddr_storage *addr)
 {
-    char pkt[sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)];
+    char pkt[sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct udphdr)];
     struct ethhdr *eth;
-    struct iphdr *iph;
     ip2mac_data_t data;
     unsigned char *mac = data.m_mac;
 
-    // TODO Don't forget IP6!
-    if (ip2mac_lookup(prog->m_ip2mac_fd, prog->m_if[reqs->m_ifindex].m_ifname,
-                      reqs->m_ifindex,
-                      ((struct sockaddr_in *)addr)->sin_addr.s_addr, &data))
+    if (ip2mac_lookup(prog->m_ip2mac_fd, reqs->m_ifindex, addr, &data))
     {
         int err = errno;
         DEBUG_MESSAGE("Can't lookup address: %s\n", strerror(err));
@@ -1108,18 +1172,16 @@ static int set_reqs(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
         errno = err;
         return -1;
     }
-    memcpy(&reqs->m_sa_in, addr, sizeof(reqs->m_sa_in));
+    if (addr->ss_family == AF_INET)
+        memcpy(&reqs->m_sa_in, addr, sizeof(reqs->m_sa_in));
+    else
+        memcpy(&reqs->m_sa_in6, addr, sizeof(reqs->m_sa_in6));
     memcpy(&reqs->m_mac, mac, sizeof(reqs->m_mac));
     DEBUG_MESSAGE("Hardware address: %02x:%02x:%02x:%02x:%02x:%02x\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     // TODO: If the address type changes I must rebuild the header as well
     if (reqs->m_sendable)
     {
-        //printf("Change remote addr to %u.%u.%u.%u\n",
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[0],
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[1],
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[2],
-        //       ((unsigned char *)&sock->m_reqs->m_sa_in.sin_addr.s_addr)[3]);
         update_header(reqs);
     }
     else
@@ -1129,14 +1191,35 @@ static int set_reqs(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
         memcpy(eth->h_source, mac, sizeof(eth->h_dest));
         memcpy(eth->h_dest, prog->m_if[reqs->m_ifindex].m_mac,
                sizeof(eth->h_source));
-        eth->h_proto = __constant_htons(ETH_P_IP);
-        iph = (struct iphdr *)(eth + 1);
-        iph->version = 4;
-        iph->ihl = 5;
-        iph->ttl = 20;
-        iph->protocol = 17; // UDP
-        iph->daddr = prog->m_if[reqs->m_ifindex].m_sa_in.sin_addr.s_addr;
-        iph->saddr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
+        if (addr->ss_family == AF_INET)
+        {
+            struct iphdr *iph;
+            eth->h_proto = __constant_htons(ETH_P_IP);
+            iph = (struct iphdr *)(eth + 1);
+            iph->version = 4;
+            iph->ihl = 5;
+            iph->ttl = 20;
+            iph->protocol = 17; // UDP
+            iph->daddr = prog->m_if[reqs->m_ifindex].m_sa_in.sin_addr.s_addr;
+            iph->saddr = ((struct sockaddr_in *)addr)->sin_addr.s_addr;
+        }
+        else
+        {
+            struct ipv6hdr *ip6h;
+            eth->h_proto = __constant_htons(ETH_P_IPV6);
+            ip6h = (struct ipv6hdr *)(eth + 1);
+            ip6h->version = 6;
+            ip6h->flow_lbl[0] = 0;
+            ip6h->flow_lbl[1] = 0;
+            ip6h->flow_lbl[2] = 0;
+            ip6h->payload_len = sizeof(struct udphdr); // This is wrong at this time.
+            ip6h->nexthdr = 17; // UDP
+            ip6h->hop_limit = 0x40;
+            memcpy(&ip6h->daddr, &prog->m_if[reqs->m_ifindex].m_sa_in6.sin6_addr,
+                   sizeof(ip6h->daddr));
+            memcpy(&ip6h->saddr, &((struct sockaddr_in6 *)addr)->sin6_addr,
+                   sizeof(ip6h->saddr));
+        }
         rebuild_header(reqs, pkt, addr);
     }
     return 0;
@@ -1144,15 +1227,21 @@ static int set_reqs(xdp_prog_t *prog, lsxdp_socket_reqs_t *reqs,
 
 
 lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
-                                         const struct sockaddr *addr,
+                                         const struct sockaddr_storage *addr,
                                          socklen_t addrLen,
-                                         const struct sockaddr *addr_bind,
+                                         const struct sockaddr_storage *addr_bind,
                                          const char *ifport)
 {
     lsxdp_socket_reqs_t *reqs;
     int enabled_if;
+    char str_ip[MAX_STR_SOCKADDR];
 
-    DEBUG_MESSAGE("xdp_get_socket_reqs - check_if\n");
+    if (addr)
+        DEBUG_MESSAGE("xdp_get_socket_reqs - addr: %s, port: %d check_if\n",
+                      str_sockaddr((struct sockaddr_storage *)addr, str_ip, sizeof(str_ip)),
+                      __constant_htons(addr->ss_family == AF_INET ?
+                                        ((struct sockaddr_in *)addr)->sin_port :
+                                        ((struct sockaddr_in6 *)addr)->sin6_port));
     if (check_if(prog, ifport, addr_bind, &enabled_if))
         return NULL;
 
@@ -1169,7 +1258,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
     reqs->m_sendable = 0;
     if (!addr)
         return reqs;
-    if (set_reqs(prog, reqs, (struct sockaddr *)addr))
+    if (set_reqs(prog, reqs, (struct sockaddr_storage *)addr))
         return NULL;
 
     DEBUG_MESSAGE("xdp_get_socket_reqs - WORKED! header size %d "
@@ -1196,7 +1285,7 @@ lsxdp_socket_reqs_t *xdp_get_socket_reqs(xdp_prog_t *prog,
 int xdp_get_local_addr(xdp_prog_t *prog,
                        lsxdp_socket_reqs_t *reqs,
                        int ipv4,
-                       struct sockaddr *addr)
+                       struct sockaddr_storage *addr)
 {
     return ifport_to_addr_bind(prog, prog->m_if[reqs->m_ifindex].m_ifname, ipv4,
                                addr);
@@ -1468,59 +1557,96 @@ int xdp_release_send_buffer(xdp_socket_t *sock, void *buffer)
 }
 
 
-static int get_remote_info(xdp_socket_t *sock, struct sockaddr *addr)
+static int get_remote_info(xdp_socket_t *sock, struct sockaddr_storage *addr)
 {
     return set_reqs(sock->m_xdp_prog, sock->m_reqs, addr);
 }
 
 
-static int check_send_addr(xdp_socket_t *sock, struct sockaddr *addr)
+static int check_send_addr(xdp_socket_t *sock, struct sockaddr_storage *addr)
 {
-    if (((struct sockaddr_in *)addr)->sin_family == AF_INET6)
-    {
-    	DEBUG_MESSAGE("IPv4 only supported for separate send/recv\n");
-        snprintf(sock->m_xdp_prog->m_err, LSXDP_PRIVATE_MAX_ERR_LEN,
-                 "IPv4 only supported for separate send/recv");
-        return -1;
-    }
+    char str_ip[MAX_STR_SOCKADDR];
     if (sock->m_reqs->m_sendable &&
-        (!((struct sockaddr_in *)addr)->sin_addr.s_addr ||
-         ((struct sockaddr_in *)addr)->sin_addr.s_addr == sock->m_reqs->m_sa_in.sin_addr.s_addr))
+        (((addr->ss_family == AF_INET6) &&
+          ((!((struct sockaddr_in6 *)addr)->sin6_addr.in6_u.u6_addr32[0] &&
+            !((struct sockaddr_in6 *)addr)->sin6_addr.in6_u.u6_addr32[1] &&
+            !((struct sockaddr_in6 *)addr)->sin6_addr.in6_u.u6_addr32[2] &&
+            !((struct sockaddr_in6 *)addr)->sin6_addr.in6_u.u6_addr32[3]) ||
+           (!memcmp(&((struct sockaddr_in6 *)addr)->sin6_addr,
+                    &sock->m_reqs->m_sa_in6.sin6_addr,
+                    sizeof(struct in6_addr))))) ||
+         ((addr->ss_family == AF_INET) &&
+          (!((struct sockaddr_in *)addr)->sin_addr.s_addr ||
+           ((struct sockaddr_in *)addr)->sin_addr.s_addr == sock->m_reqs->m_sa_in.sin_addr.s_addr))))
         // Use the one in cache
         return 0;
-    DEBUG_MESSAGE("check_send_addr: family: %u addr: %u.%u.%u.%u port: %d\n",
+
+    DEBUG_MESSAGE("check_send_addr: family: %u addr: %s port: %d\n",
                   ((struct sockaddr_in *)addr)->sin_family,
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[0],
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[1],
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[2],
-                  ((unsigned char *)&((struct sockaddr_in *)addr)->sin_addr.s_addr)[3],
-                  __constant_htons(((struct sockaddr_in *)addr)->sin_port));
+                  str_sockaddr(addr, str_ip, sizeof(str_ip)),
+                  __constant_htons(addr->ss_family == AF_INET ?
+                                       ((struct sockaddr_in *)addr)->sin_port :
+                                       ((struct sockaddr_in6 *)addr)->sin6_port));
     return get_remote_info(sock, addr);
 }
 
 
+static unsigned short ipv6_udp_checksum(char *buffer, int data_len)
+{
+    struct ipv6_pseudo_header
+    {
+        unsigned char saddr[16];
+        unsigned char daddr[16];
+        unsigned char udp_length[4];
+        unsigned char zeros[3];
+        unsigned char nh;
+    };
+    struct ipv6_pseudo_header *pheader = (struct ipv6_pseudo_header *)buffer;
+    struct ipv6_pseudo_header  save_hdr;
+    struct ipv6hdr *ipv6h = (struct ipv6hdr *)&save_hdr;
+    unsigned short check;
+
+    memcpy(&save_hdr, buffer, sizeof(save_hdr));
+    DEBUG_MESSAGE("Generating ipv6_udp_checksum.  Saving:\n");
+    traceBuffer((const char *)&save_hdr, sizeof(save_hdr));
+    memcpy(pheader->saddr, &ipv6h->saddr, sizeof(pheader->saddr));
+    memcpy(pheader->daddr, &ipv6h->daddr, sizeof(pheader->daddr));
+    *(uint32_t *)pheader->udp_length = __constant_htonl(data_len + 8);
+    pheader->zeros[0] = 0;
+    pheader->zeros[1] = 0;
+    pheader->zeros[2] = 0;
+    pheader->nh = 0x11;
+    DEBUG_MESSAGE("Using ipv6 pseudo header:\n");
+    traceBuffer(buffer, sizeof(save_hdr));
+    check = checksum(buffer, sizeof(save_hdr) + 8 + data_len);
+    memcpy(buffer, &save_hdr, sizeof(save_hdr));
+    return check;
+}
+
+
 static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
-                     struct sockaddr *addr)
+                     struct sockaddr_storage *addr)
 {
     int ip_index;
     struct udphdr *udphdr;
     char *buffer_char = buffer;
     __u16 port = sock->m_in_port;
-    int headroom = xdp_send_udp_headroom(sock);
+    int headroom = send_udp_headroom(addr);
     /* Fill in the headroom header (ethernet, IP, UDP) */
-    memcpy(buffer, sock->m_reqs->m_rec.m_header, xdp_send_udp_headroom(sock));
+    memcpy(buffer, sock->m_reqs->m_rec.m_header, headroom);
     ip_index = sock->m_reqs->m_rec.m_ip_index;
     if (sock->m_reqs->m_rec.m_ip4)
     {
         struct ethhdr *ethhdr = (struct ethhdr *)buffer_char;
         memcpy(ethhdr->h_dest, sock->m_reqs->m_mac, sizeof(ethhdr->h_dest));
+
         struct iphdr *iphdr = (struct iphdr *)&buffer_char[ip_index];
         DEBUG_MESSAGE("TX: ip_index begins at %d\n", ip_index);
         iphdr->ihl = 5;
         iphdr->tot_len = __constant_htons(20 + sizeof(struct udphdr) + len);
         iphdr->id = 0;
-        iphdr->frag_off = 0;
-        iphdr->ttl = 20;
+        iphdr->frag_off = __constant_htons(0x4000); // Don't fragment.
+        iphdr->ttl = 64;
         iphdr->protocol = 17; // UDP
         iphdr->daddr = sock->m_reqs->m_sa_in.sin_addr.s_addr;
         iphdr->check = 0;
@@ -1540,7 +1666,7 @@ static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
         struct ipv6hdr *ipv6hdr = (struct ipv6hdr *)&((char *)buffer)[ip_index];
         ipv6hdr->payload_len = __constant_htons(sizeof(struct udphdr) + len);
         ipv6hdr->nexthdr = 17; // UDP
-        ipv6hdr->hop_limit = 20;
+        ipv6hdr->hop_limit = 0x40;
         if (addr && ((struct sockaddr_in6 *)addr)->sin6_port)
         {
             port = ((struct sockaddr_in6 *)addr)->sin6_port;
@@ -1553,15 +1679,15 @@ static int x_send_zc(xdp_socket_t *sock, void *buffer, int len, int last,
     udphdr->len = __constant_htons(sizeof(*udphdr) + len);
     udphdr->check = 0;
     if (!sock->m_reqs->m_rec.m_ip4)
-        udphdr->check = checksum(udphdr, sizeof(*udphdr) + len);
+        udphdr->check = ipv6_udp_checksum(&((char *)buffer)[ip_index], len);
     return tx_only(sock, buffer, len + headroom, last);
 }
 
 
 static int x_send(xdp_socket_t *sock, void *data, int len, int last,
-                  struct sockaddr *addr, int must_zero_copy)
+                  struct sockaddr_storage *addr, int must_zero_copy)
 {
-    int headroom = xdp_send_udp_headroom(sock);
+    int headroom = send_udp_headroom(addr);
     xdp_prog_t *prog = sock->m_xdp_prog;
     int queue = sock->m_queue;
     char *send_buffer;
@@ -1635,25 +1761,26 @@ static int x_send(xdp_socket_t *sock, void *data, int len, int last,
 
 
 int xdp_send(xdp_socket_t *sock, void *data, int len, int last,
-             struct sockaddr *addr)
+             struct sockaddr_storage *addr)
 {
     return x_send(sock, data, len, last, addr, 0);
 }
 
 
 int xdp_send_zc(xdp_socket_t *sock, void *data, int len, int last,
-                struct sockaddr *addr)
+                struct sockaddr_storage *addr)
 {
     return x_send(sock, data, len, last, addr, 1);
 }
 
 
 static int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len,
-                             int *header_pos, struct sockaddr *addr,
+                             int *header_pos, struct sockaddr_storage *addr,
                              socklen_t *addrlen)
 {
     /* Note to return 1 to ignore packet, 0 to continue processing, and -1 for
      * an error.  */
+    char str_ip[MAX_STR_SOCKADDR];
     if (len < xdp_send_udp_headroom(sock))
     {
         DEBUG_MESSAGE("Recv Packet too small to be UDP\n");
@@ -1683,11 +1810,8 @@ static int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len,
             ((struct sockaddr_in *)addr)->sin_port = udph->source;
             DEBUG_MESSAGE("Recv save address and port to %p\n", addr);
         }
-        DEBUG_MESSAGE("Recv Remote addr %u.%u.%u.%u:%d\n",
-                      ((unsigned char *)&iph->saddr)[0],
-                      ((unsigned char *)&iph->saddr)[1],
-                      ((unsigned char *)&iph->saddr)[2],
-                      ((unsigned char *)&iph->saddr)[3],
+        DEBUG_MESSAGE("Recv Remote addr %s:%d\n",
+                      str_sockaddr(addr, str_ip, sizeof(str_ip)),
                       __constant_htons(udph->source));
     }
     else if (((struct ethhdr *)pkt)->h_proto == __constant_htons(ETH_P_IPV6))
@@ -1711,13 +1835,13 @@ static int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len,
             memcpy(&((struct sockaddr_in6 *)addr)->sin6_addr, &ip6h->saddr,
                    sizeof(struct in6_addr));
             ((struct sockaddr_in6 *)addr)->sin6_port = udph->source;
-            DEBUG_MESSAGE("Recv save address and port (%d)\n",
-                          __constant_htons(udph->source));
+            DEBUG_MESSAGE("Recv save address and port (%d), header_pos: %d\n",
+                          __constant_htons(udph->source), *header_pos);
         }
     }
     else
     {
-        DEBUG_MESSAGE("Recv not IPv4 or IPv6 or ARP\n");
+        DEBUG_MESSAGE("Recv not IPv4 or IPv6\n");
         return 1;
     }
     return 0;
@@ -1725,7 +1849,7 @@ static int parse_recv_ip_hdr(xdp_socket_t *sock, char *pkt, int len,
 
 
 static int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len,
-                              int *header_pos, struct sockaddr *addr)
+                              int *header_pos, struct sockaddr_storage *addr)
 {
     struct udphdr *udp = (struct udphdr *)((unsigned char *)pkt + *header_pos);
     if (*header_pos + sizeof(struct udphdr) > *len)
@@ -1735,9 +1859,7 @@ static int parse_recv_udp_hdr(xdp_socket_t *sock, char *pkt, int *len,
     }
     if (udp->dest && udp->dest != sock->m_reqs->m_port)
     {
-        /* Check both send and recv ports because I don't know an ACK from a
-         * true receive (for now).  */
-        DEBUG_MESSAGE("Recv port mismatch (%d != %d)\n",
+        DEBUG_MESSAGE("Recv port mismatch (recvd: %d != expected: %d)\n",
                       __constant_htons(udp->dest),
                       __constant_htons(sock->m_reqs->m_port));
         return 1;
@@ -1788,8 +1910,8 @@ static int recv_return_raw(xdp_socket_t *sock, void *buffer)
 }
 
 
-int xdp_recv(xdp_socket_t *sock, void **data, int *sz, struct sockaddr *sockaddr,
-             socklen_t *addrlen)
+int xdp_recv(xdp_socket_t *sock, void **data, int *sz,
+             struct sockaddr_storage *sockaddr, socklen_t *addrlen)
 {
 	unsigned int rcvd;
 	u32 idx_rx = 0;

@@ -9,18 +9,15 @@
 #include <ctype.h>
 
 int bpf(int cmd, union bpf_attr *attr, unsigned int size);
-/* see lsxdp.c for the real DEBUG_MESSAGE */
-int debug_message(const char *format, ...);
-#define DEBUG_MESSAGE debug_message
-
 #define BUFSIZE 8192
 
 struct gw_info {
-    int      ifi;
-    int      get_addr;
-    uint32_t ip;
-    char     mac[ETH_ALEN];
-    int      mac_found;
+    int                         ifi;
+    int                         get_addr;
+    struct sockaddr_storage     ip;
+    char                        mac[ETH_ALEN];
+    int                         mac_found;
+    int                         gw_found;
 };
 
 int send_req(int sock, char *buf, size_t nlseq, size_t req_type)
@@ -97,15 +94,16 @@ void parse_route(struct nlmsghdr *nlmsg, void *gw)
 {
     struct rtmsg *rtmsg;
     struct rtattr *attr;
-    uint32_t gw_tmp;
     size_t len;
     struct gw_info *info;
-    int ip = 0;
+    int ip_found = 0;
+    struct sockaddr_storage sa;
 
     info = (struct gw_info *)gw;
     rtmsg = (struct rtmsg *)NLMSG_DATA(nlmsg);
 
-    if (rtmsg->rtm_family != AF_INET || rtmsg->rtm_table != RT_TABLE_MAIN)
+    if (rtmsg->rtm_family != info->ip.ss_family ||
+        rtmsg->rtm_table != RT_TABLE_MAIN)
     {
         //DEBUG_MESSAGE("Return early from parse_route\n"); Lots of reasons
         return;
@@ -113,32 +111,40 @@ void parse_route(struct nlmsghdr *nlmsg, void *gw)
     attr = (struct rtattr *)RTM_RTA(rtmsg);
     len = RTM_PAYLOAD(nlmsg);
 
+    memset(&sa, 0, sizeof(sa));
+    sa.ss_family = info->ip.ss_family;
     for (; RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
-        //if (attr->rta_type == RTA_OIF)
-        //    DEBUG_MESSAGE("Type == OIF, Data == %d\n", *(int *)RTA_DATA(attr));
-        //if (attr->rta_type == RTA_OIF && *(int *)RTA_DATA(attr) != info->ifi)
-        //{
-        //    DEBUG_MESSAGE("Skip route entry for output interface %d != %d\n",
-        //                  *(int *)RTA_DATA(attr), info->ifi);
-        //    return;
-        //}
+        if (attr->rta_type == RTA_OIF)
+            DEBUG_MESSAGE("Type == OIF, Data == %d\n", *(int *)RTA_DATA(attr));
+        if (attr->rta_type == RTA_OIF && *(int *)RTA_DATA(attr) != info->ifi)
+        {
+            DEBUG_MESSAGE("Skip route entry for output interface %d != %d\n",
+                          *(int *)RTA_DATA(attr), info->ifi);
+            return;
+        }
         if (attr->rta_type != RTA_GATEWAY)
             continue;
-        ip = *(uint32_t *)RTA_DATA(attr);
-        DEBUG_MESSAGE("   Initial IP: %u.%u.%u.%u.\n",
-                      ((unsigned char *)&ip)[0],
-                      ((unsigned char *)&ip)[1],
-                      ((unsigned char *)&ip)[2],
-                      ((unsigned char *)&ip)[3]);
+        if (info->ip.ss_family == AF_INET)
+            ((struct sockaddr_in *)&sa)->sin_addr.s_addr = *(uint32_t *)RTA_DATA(attr);
+        else
+        {
+            DEBUG_MESSAGE("About to do IPv6 copy (1)\n");
+            memcpy(&((struct sockaddr_in6 *)&sa)->sin6_addr,
+                   RTA_DATA(attr), sizeof(struct in6_addr));
+            DEBUG_MESSAGE("Did IPv6 copy (1)\n");
+        }
+        char str_ip[MAX_STR_SOCKADDR];
+        DEBUG_MESSAGE("   Initial IP: %s\n",
+                      str_sockaddr(&sa, str_ip, sizeof(str_ip)));
+        ip_found = 1;
     }
-    if (ip)
+    if (ip_found)
     {
-        info->ip = ip;
-        DEBUG_MESSAGE("Gateway IP: %u.%u.%u.%u.\n",
-                      ((unsigned char *)&info->ip)[0],
-                      ((unsigned char *)&info->ip)[1],
-                      ((unsigned char *)&info->ip)[2],
-                      ((unsigned char *)&info->ip)[3]);
+        char str_ip[MAX_STR_SOCKADDR];
+        memcpy(&info->ip, &sa, sizeof(info->ip));
+        DEBUG_MESSAGE("Gateway IP: %s\n",
+                      str_sockaddr(&info->ip, str_ip, sizeof(str_ip)));
+        info->gw_found = 1;
     }
 }
 
@@ -148,13 +154,16 @@ void parse_neigh(struct nlmsghdr *nlmsg, void *gw)
     struct rtattr *attr;
     size_t len;
     unsigned char mac[ETH_ALEN];
-    uint32_t ip = 0;
+    int ip_found = 0;
+    int matched = 0;
     struct gw_info *info;
+    struct sockaddr_storage sa;
+    char str_ip1[MAX_STR_SOCKADDR], str_ip2[MAX_STR_SOCKADDR];
 
     info = (struct gw_info *)gw;
     ndmsg = (struct ndmsg *)NLMSG_DATA(nlmsg);
 
-    if (ndmsg->ndm_family != AF_INET)
+    if (ndmsg->ndm_family != info->ip.ss_family)
         return;
 
     if (ndmsg->ndm_ifindex != info->ifi)
@@ -167,23 +176,36 @@ void parse_neigh(struct nlmsghdr *nlmsg, void *gw)
     attr = (struct rtattr *)RTM_RTA(ndmsg);
     len = RTM_PAYLOAD(nlmsg);
 
-    for (; RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
+    memset(&sa, 0, sizeof(sa));
+    sa.ss_family = info->ip.ss_family;
+    str_sockaddr(&info->ip, str_ip2, sizeof(str_ip2));
+    for (; RTA_OK(attr, len); attr = RTA_NEXT(attr, len))
+    {
         if (attr->rta_type == NDA_LLADDR)
             memcpy(mac, RTA_DATA(attr), ETH_ALEN);
 
         if (attr->rta_type == NDA_DST)
         {
-            ip = *(uint32_t *)RTA_DATA(attr);
-            DEBUG_MESSAGE("IP found: %u.%u.%u.%u (0x%x compared to 0x%x).\n",
-                          ((unsigned char *)&ip)[0],
-                          ((unsigned char *)&ip)[1],
-                          ((unsigned char *)&ip)[2],
-                          ((unsigned char *)&ip)[3],
-                          info->ip, ip);
+            ip_found = 1;
+            if (info->ip.ss_family == AF_INET)
+                ((struct sockaddr_in *)&sa)->sin_addr.s_addr = *(uint32_t *)RTA_DATA(attr);
+            else
+            {
+                DEBUG_MESSAGE("About to do IPv6 copy\n");
+                memcpy(&((struct sockaddr_in6 *)&sa)->sin6_addr.in6_u,
+                       RTA_DATA(attr),
+                       sizeof(((struct sockaddr_in6 *)&sa)->sin6_addr.in6_u));
+                DEBUG_MESSAGE("Did IPv6 copy\n");
+            }
+            str_sockaddr(&sa, str_ip1, sizeof(str_ip1));
+            if (!strcmp(str_ip1, str_ip2))
+                matched = 1;
+            DEBUG_MESSAGE("IP found: %s (matched: %s)\n", str_ip1,
+                          matched ? "YES" : "NO");
         }
     }
 
-    if (ip && ip == info->ip)
+    if (ip_found && matched)
     {
         memcpy(info->mac, mac, ETH_ALEN);
         DEBUG_MESSAGE("Mac found: %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0],
@@ -203,7 +225,8 @@ void parse_response(char *buf, size_t len, void (cb)(struct nlmsghdr *, void *),
         cb(nlmsg, arg);
 }
 
-static int get_addr_gw(int get_addr, int ifi, __u32 addr, char mac[])
+static int get_addr_gw(int get_addr, int ifi, const struct sockaddr_storage *addr,
+                       unsigned char mac[])
 {
     DEBUG_MESSAGE("get_addr_gw, addr: %s, if_index: %d\n",
                   get_addr ? "YES" : "NO", ifi);
@@ -223,9 +246,8 @@ static int get_addr_gw(int get_addr, int ifi, __u32 addr, char mac[])
     memset(&gw, 0, sizeof(gw));
     gw.get_addr = get_addr;
     gw.ifi = ifi;
-    if (get_addr)
-        gw.ip = addr;
-    else
+    memcpy(&gw.ip, addr, sizeof(gw.ip));
+    if (!get_addr)
     {
         nlseq = send_req(sock, buf, nlseq, RTM_GETROUTE);
         if (nlseq == -1)
@@ -245,6 +267,12 @@ static int get_addr_gw(int get_addr, int ifi, __u32 addr, char mac[])
             return -1;
         }
         parse_response(buf, msg_len, &parse_route, &gw);
+        if (!gw.gw_found)
+        {
+            DEBUG_MESSAGE("Gateway not found\n");
+            errno = ENOENT;
+            return -1;
+        }
     }
     nlseq = send_req(sock, buf, nlseq, RTM_GETNEIGH);
     if (nlseq == -1)
@@ -281,13 +309,14 @@ static int get_addr_gw(int get_addr, int ifi, __u32 addr, char mac[])
 
 int ip2mac_init(int max)
 {
-    return bpf_create_map(BPF_MAP_TYPE_HASH, sizeof(__u32),
+    return bpf_create_map(BPF_MAP_TYPE_HASH, sizeof(struct sockaddr_storage),
                           sizeof(ip2mac_data_t), max, 0/*BPF_F_MMAPABLE*/);
 }
 
-int ip2mac_lookup(int fd, char *ifn, int ifi, __u32 addr, ip2mac_data_t *data)
+int ip2mac_lookup(int fd, int ifi, const struct sockaddr_storage *addr,
+                  ip2mac_data_t *data)
 {
-    if (!bpf_map_lookup_elem(fd, &addr, data))
+    if (!bpf_map_lookup_elem(fd, addr, data))
         return 0;
     if (get_addr_gw(1, ifi, addr, data->m_mac))
     {

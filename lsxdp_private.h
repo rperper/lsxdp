@@ -55,6 +55,7 @@ typedef struct lsxdp_socket_reqs_s
     int                 m_sendable;
     char                m_mac[MAC_LEN];
     struct sockaddr_in  m_sa_in;
+    struct sockaddr_in6 m_sa_in6;
     struct packet_rec   m_rec;
 } lsxdp_socket_reqs_t;
 
@@ -117,6 +118,14 @@ typedef struct xdp_prog_s
     const char             *m_virtio_ifname;
     int                     m_hardware;
 } xdp_prog_t;
+
+/* Internal use functions only: */
+#define MAX_STR_SOCKADDR    42
+char *str_sockaddr(struct sockaddr_storage *addr, char *str, int str_size);
+
+/* see lsxdp.c for the real DEBUG_MESSAGE */
+int debug_message(const char *format, ...);
+#define DEBUG_MESSAGE debug_message
 
 
 #include "bpf_xdp.h"

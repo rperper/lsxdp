@@ -27,8 +27,9 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
 	struct hdr_cursor nh;
     struct ethhdr *eth;
     struct iphdr  *iphdr;
+    struct ipv6hdr *ipv6hdr;
     struct udphdr *udphdr;
-    struct ip_key ipkey = { 0 };
+    //struct ip_key ipkey = { 0 };
     //int *ipkey_val = NULL;
     int af_xdp = 0;
 	nh.pos = data;
@@ -38,14 +39,13 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
     {
    		int ip_type = parse_iphdr(&nh, data_end, &iphdr);
 		if (ip_type != IPPROTO_UDP)
-        {
 			goto out;
-        }
     }
     else if (h_proto == bpf_htons(ETH_P_IPV6))
     {
-        // TODO IPv6
-		goto out;
+        int ip_type = parse_ip6hdr(&nh, data_end, &ipv6hdr);
+        if (ip_type != IPPROTO_UDP)
+            goto out;
     }
     else
     {
@@ -56,12 +56,30 @@ SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
         goto out;
     }
 #ifdef USE_PRINTK
-    bpf_printk("sock_prog IP source: %u.%u",
-               ((unsigned char *)&iphdr->saddr)[0],
-               ((unsigned char *)&iphdr->saddr)[1]);
-    bpf_printk("  .%u.%u\n",
-               ((unsigned char *)&iphdr->saddr)[2],
-               ((unsigned char *)&iphdr->saddr)[3]);
+    if (h_proto == bpf_htons(ETH_P_IP))
+    {
+        bpf_printk("sock_prog IP source: %u.%u",
+                   ((unsigned char *)&iphdr->saddr)[0],
+                   ((unsigned char *)&iphdr->saddr)[1]);
+        bpf_printk("  .%u.%u\n",
+                   ((unsigned char *)&iphdr->saddr)[2],
+                   ((unsigned char *)&iphdr->saddr)[3]);
+    }
+    else
+    {
+        bpf_printk("sock_prog IPv6 source: %x:%x",
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[0]),
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[1]));
+        bpf_printk(":%x:%x",
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[2]),
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[3]));
+        bpf_printk(":%x:%x",
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[4]),
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[5]));
+        bpf_printk(":%x:%x",
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[6]),
+                   bpf_htons(ipv6hdr->saddr.in6_u.u6_addr16[7]));
+    }
     bpf_printk("sock_prog ports: %d %d\n", bpf_htons(udphdr->source),
                bpf_htons(udphdr->dest));
 #endif
@@ -79,6 +97,7 @@ out:
     if (!af_xdp)
         goto no_xdp;
 
+    /*
     if (h_proto == bpf_htons(ETH_P_IP))
     {
         ipkey.family = 2;//AF_INET;
@@ -91,7 +110,6 @@ out:
 #endif
         return XDP_DROP;
     }
-    /*
 	ipkey_val = bpf_map_lookup_elem(&ip_key_map, &ipkey);
     if (!ipkey_val)
     {
